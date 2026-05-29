@@ -1,0 +1,33 @@
+.venv/
+__pycache__/
+*.pyc
+dev-ignore/
+report.md
+eval_bundle/
+
+# Secrets
+.env
+
+# Local setup
+CLAUDE.md
+wandb/
+*.egg-info/
+nanochat/modeling_nanomoe_gpt.py
+nanochat/configuration_nanomoe_gpt2.py
+scripts/nanoMoE_train.py
+nanochat/gpt2.py
+output
+.vscode/*
+slurm-*.out
+slurm-*.err
+
+tmp/*
+.codex/*
+node_modules
+package*json
+base_train*.e*
+base_train*.o*
+pbs*.err
+pbs*.out
+*debug.log
+figures/

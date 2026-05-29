@@ -1,0 +1,2100 @@
+"""
+Train model. From root directory of the project, run as:
+
+python -m scripts.base_train
+
+or distributed as:
+
+torchrun --nproc_per_node=8 -m scripts.base_train
+
+If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
+python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+"""
+
+import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+import gc
+import json
+import time
+import math
+import argparse
+import sys
+import signal
+import shlex
+from contextlib import nullcontext, contextmanager
+import re
+
+import wandb
+import torch
+
+from nanochat.gpt import GPT, get_moe_layer_indices
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops
+from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from nanochat.checkpoint_manager import delete_checkpoint_step, delete_old_checkpoints, save_checkpoint, load_checkpoint, inspect_optimizer_shards, load_optimizer_state_dict, snapshot_checkpoint_file_sizes, validate_checkpoint_file_sizes
+from nanochat.loss_eval import evaluate_bpb
+from nanochat.engine import Engine
+from nanochat.flash_attention import HAS_FLASH_ATTN, FLASH_ATTN_BACKEND, FLASH_ATTN_UNAVAILABLE_REASON, ALLOW_FA4_TRAINING
+from scripts.base_eval import evaluate_core
+from nanochat.configuration_nanomoe_gpt import GPTConfig
+from nanochat.manager import MANAGER
+torch.set_printoptions(sci_mode=False)
+
+# print_banner()
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def arg_was_explicitly_set(argv, option_name):
+    return any(token == option_name or token.startswith(f"{option_name}=") for token in argv)
+
+
+def env_flag_is_true(name):
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return str2bool(value)
+
+
+def _first_nonfinite_tensor_entry(tensor):
+    bad = (~torch.isfinite(tensor)).nonzero(as_tuple=False)
+    if bad.numel() == 0:
+        return None
+    index = tuple(int(i) for i in bad[0].tolist())
+    value = tensor[index]
+    return index, float(value.item())
+
+
+def find_first_nonfinite_grad(model):
+    for name, param in model.named_parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        result = _first_nonfinite_tensor_entry(grad)
+        if result is not None:
+            index, value = result
+            return name, index, value
+    return None
+
+
+def summarize_loss_snapshot(loss, micro_losses):
+    snapshot = {
+        "loss": float(loss.detach().float().item()),
+    }
+    for key, value in micro_losses.items():
+        if torch.is_tensor(value):
+            snapshot[key] = float(value.detach().float().item())
+        else:
+            snapshot[key] = float(value)
+    return snapshot
+
+
+def infer_last_completed_core_eval_step(checkpoint_dir, current_step, core_metric_every):
+    if core_metric_every <= 0 or not os.path.isdir(checkpoint_dir):
+        return None
+
+    last_core_eval_step = None
+    for entry in os.scandir(checkpoint_dir):
+        if not entry.is_file():
+            continue
+        match = re.match(r"meta_(\d+)\.json$", entry.name)
+        if match is None:
+            continue
+        candidate_step = int(match.group(1))
+        if candidate_step >= current_step:
+            continue
+        if candidate_step == 0 or candidate_step % core_metric_every != 0:
+            continue
+        model_path = os.path.join(checkpoint_dir, f"model_{candidate_step:06d}.pt")
+        if not os.path.isfile(model_path):
+            continue
+        if last_core_eval_step is None or candidate_step > last_core_eval_step:
+            last_core_eval_step = candidate_step
+
+    return last_core_eval_step
+
+
+shutdown_requested = False
+shutdown_signal_name = None
+
+
+def handle_shutdown_signal(signum, frame):
+    del frame
+    global shutdown_requested
+    global shutdown_signal_name
+    shutdown_requested = True
+    try:
+        shutdown_signal_name = signal.Signals(signum).name
+    except ValueError:
+        shutdown_signal_name = f"signal {signum}"
+
+
+def build_chat_sft_exec_argv(
+    python_executable,
+    model_tag,
+    model_step,
+    extra_args_text="",
+):
+    import shlex
+
+    argv = [
+        python_executable,
+        "-m",
+        "scripts.chat_sft",
+        "--log-grad-stats",
+        "--model-tag",
+        model_tag,
+        "--model-step",
+        str(model_step),
+    ]
+    if extra_args_text:
+        argv.extend(shlex.split(extra_args_text))
+    return argv
+
+
+def pick_free_tcp_port():
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
+def prepare_chat_sft_rendezvous(ddp, ddp_rank, device):
+    import torch
+
+    if not ddp:
+        return None
+
+    chat_sft_master_port = 0
+    if ddp_rank == 0:
+        chat_sft_master_port = pick_free_tcp_port()
+    port_tensor = torch.tensor([chat_sft_master_port], device=device, dtype=torch.int64)
+    torch.distributed.broadcast(port_tensor, src=0)
+    chat_sft_master_port = int(port_tensor.item())
+    os.environ["MASTER_PORT"] = str(chat_sft_master_port)
+    torch.distributed.barrier()
+    return chat_sft_master_port
+
+
+def sanitize_chat_sft_rendezvous_env():
+    # chat_sft reuses the existing torchrun workers via exec(), but it needs to
+    # form a fresh TCPStore on the new MASTER_PORT instead of reusing the
+    # torchelastic agent store semantics from the previous job.
+    # base_train.py was creating a fresh MASTER_PORT for the exec into chat SFT, 
+    # but it was still leaving TORCHELASTIC_USE_AGENT_STORE in the environment. 
+    # Under torchrun that makes the new process-group init treat the rendezvous 
+    # like an agent-managed store.
+    os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
+    
+# -----------------------------------------------------------------------------
+# CLI arguments
+parser = argparse.ArgumentParser(description="Pretrain base model")
+DEFAULT_SEED = 26
+AUX_LOSS_WEIGHT_DEFAULT = 1e-3
+
+# Runtime
+parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="random seed for initialization")
+parser.add_argument("--mockup-mode", type=str2bool, nargs='?', const=True, default=False, help="skip actual training/eval/sample compute and only advance step counter")
+# FP8 training
+parser.add_argument("--fp8", type=str2bool, nargs='?', const=True, default=False, help="enable FP8 training (requires H100+ GPU and torchao)")
+parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+# Model architecture
+parser.add_argument("--depth", type=int, default=8, help="depth of the Transformer model")
+parser.add_argument("--moe-start-layer", type=int, default=2, help="first layer index of MoE layers")
+parser.add_argument("--num-moe-layers", type=int, default=-1, help="number of MoE layers to instantiate from --moe-start-layer onward (-1 = all eligible layers)")
+parser.add_argument("--n-exp", type=int, default=64, help="number of experts per MoE layer")
+parser.add_argument("--moe-top-k", type=int, default=2, help="top-k of the MoE routing")
+parser.add_argument("--use-aux-free-load-balancing", type=str2bool, nargs='?', const=True, default=False, help="enable DeepSeekV3 auxiliary-loss-free load balancing instead of the Switch auxiliary router loss")
+parser.add_argument("--aux-loss-weight", type=float, default=AUX_LOSS_WEIGHT_DEFAULT, help="final weight for the Switch-style router auxiliary load-balancing loss after the initial 500-step anneal")
+parser.add_argument("--aux-loss-weight-init-scale", type=float, default=2.0, help="initial aux loss weight scale factor; the anneal starts from --aux-loss-weight * this value")
+parser.add_argument("--aux-loss-weight-init-anneal-iterations", type=int, default=500, help="number of iterations used to anneal aux loss weight from --aux-loss-weight * --aux-loss-weight-init-scale down to --aux-loss-weight")
+parser.add_argument("--use-kappa-swiglu", type=str2bool, nargs='?', const=True, default=False,
+                    help="add a learnable bias to Qwen3 expert gate activations after gate_proj and SiLU")
+parser.add_argument("--kappa-input", dest="kappa_input", type=str, default="top_logits", choices=["top_logits", "router_probs", "constant"],
+                    help="router confidence signal used by kappa_bias: raw selected logits, top-k router probabilities, or a constant value")
+parser.add_argument("--kappa-input-constant", dest="kappa_input_constant", type=float, default=0.5,
+                    help="constant confidence value to use when --kappa-input=constant")
+parser.add_argument("--moe-kappa-slope-max-scale", type=float, default=3.0,
+                    help="maximum slope scale used by MoE kappa_bias modulation")
+parser.add_argument("--dense-kappa-slope-max-scale", type=float, default=2.0,
+                    help="maximum slope scale used by dense kappa_bias modulation")
+parser.add_argument("--kappa-slope-max-scale-warmup-iteration-frac",
+                    dest="kappa_slope_max_scale_warmup_iteration_frac", type=float, default=0.15,
+                    help="fraction of total iterations used to warm gate slope max scales from 1.0 to --moe-kappa-slope-max-scale / --dense-kappa-slope-max-scale after the initial delay window")
+parser.add_argument("--constant-kappa-dense-layers", dest="constant_kappa_dense_layers", type=str2bool, nargs='?', const=True, default=False,
+                    help="apply the constant kappa_bias path to every dense transformer MLP layer, even when MoE layers use top_logits or router_probs")
+parser.add_argument("--global-kappa-granularity", dest="global_kappa_granularity", type=str, default="per-gate",
+                    choices=["per-gate", "per-expert", "per-layer", "global"],
+                    help="sharing granularity for MoE kappa_bias: per-gate (default), per-expert, per-layer, or global")
+parser.add_argument("--kappa-start-layer", dest="kappa_start_layer", type=int, default=2,
+                    help="first transformer layer index where kappa_bias is enabled (default: when omitted and MoE is enabled, use min(moe_start_layer + 2, depth//2, 5); overridden to 0 by --constant-kappa-dense-layers)")
+parser.add_argument("--log-implicit-gate-proj-bias", dest="log_implicit_gate_proj_bias", type=str2bool, nargs='?', const=True, default=False,
+                        help="log the implicit kappa bias top/bottom 5% stats for MoE experts; this can be enabled independently of --use-kappa-swiglu")
+parser.add_argument("--kappa-lr-max-scale", dest="kappa_lr_max_scale", type=float, default=0.4,
+                    help="peak LR scale factor for kappa_bias params after warming from 0 before annealing to --kappa-lr-final-scale")
+# With slope scaling always enabled, --kappa-lr-final-scale
+# defaults to half of --kappa-lr-max-scale, which is 0.2 by default.
+parser.add_argument("--kappa-lr-final-scale", dest="kappa_lr_final_scale", type=float, default=0.2,
+                    help="final LR scale factor for kappa_bias params after warming from 0 to 1")
+parser.add_argument("--kappa-delay-start-min-iterations", dest="kappa_delay_start_min_iterations", type=int, default=200,
+                    help="number of initial iterations to keep kappa_bias LR at 0 before warmup and annealing")
+parser.add_argument("--kappa-delay-start-iteration-frac", dest="kappa_delay_start_iteration_frac", type=float, default=0.05,
+                    help="fractional delay for kappa_bias LR start; the effective delay is max(--kappa-delay-start-min-iterations, ceil(total_iterations * this value))")
+parser.add_argument("--kappa-lr-warmup-iterations", dest="kappa_lr_warmup_iterations", type=int, default=1000,
+                    help="number of iterations to linearly ramp kappa_bias LR scale from 0 to --kappa-lr-max-scale before annealing to --kappa-lr-final-scale")
+parser.add_argument("--kappa-l2-loss-weight", dest="kappa_l2_loss_weight", type=float, default=1e-2,
+                    help="L2 weight on kappa_bias and kappa_scale values")
+parser.add_argument("--kappa-ema-rms-reg", dest="kappa_ema_rms_reg", type=str2bool, nargs='?', const=True, default=False,
+                    help="enable an extra anchored EMA RMS floor regularizer for kappa_bias and kappa_scale on top of the ordinary L2 loss")
+parser.add_argument("--kappa-l2-ema-beta", dest="kappa_l2_ema_beta", type=float, default=0.99,
+                    help="EMA beta for the extra anchored EMA RMS floor regularizer used by --kappa-ema-rms-reg")
+parser.add_argument("--kappa-l2-ema-anchor-start", dest="kappa_l2_ema_anchor_start", type=float, default=0.4,
+                    help="fraction of total iterations where the anchored EMA RMS floor regularizer starts updating its target")
+parser.add_argument("--kappa-l2-ema-anchor-end", dest="kappa_l2_ema_anchor_end", type=float, default=0.5,
+                    help="fraction of total iterations where the anchored EMA RMS floor regularizer stops updating its target")
+parser.add_argument("--kappa-l2-ema-floor-frac", dest="kappa_l2_ema_floor_frac", type=float, default=0.9,
+                    help="floor fraction applied to the anchored EMA RMS target when --kappa-ema-rms-reg is enabled")
+parser.add_argument("--kappa-scale-l2-loss-weight-scale", type=float, default=2.0,
+                    help="multiplier applied to --kappa-l2-loss-weight when weighting kappa_scale L2 loss")
+parser.add_argument("--kappa-l2-loss-anneal-iterations", dest="kappa_l2_loss_anneal_iterations", type=int, default=-1, help="iterations for stage-1 anneal of the MoE (2D) kappa_bias L2 loss from 1.0 to --kappa-l2-loss-stage1-frac (-1 = use half total training iterations)")
+# By default, the stage1 frac and final frac are set to 1 to 
+# push the kappa_bias values towards 0 so that the slopes 
+# are pushed towards 1.
+parser.add_argument("--kappa-l2-loss-stage1-frac", dest="kappa_l2_loss_stage1_frac", type=float, default=1, help="fraction of the MoE (2D) kappa_bias L2 base weight to reach at the end of stage 1 (1 = no stage-1 annealing)")
+parser.add_argument("--kappa-l2-loss-final-frac", dest="kappa_l2_loss_final_frac", type=float, default=1, help="fraction of the MoE (2D) kappa_bias L2 base weight to reach at the end of training during stage 2 (can be above --kappa-l2-loss-stage1-frac to re-increase in stage 2)")
+parser.add_argument("--bilinear-mlp-moe", type=str2bool, nargs='?', const=True, default=False,
+                    help="disable the SiLU gate in Qwen3-style MoE MLPs only, using raw bilinear gating in expert layers")
+# router-z-loss is around 200. So * weight ~ 0.002.
+parser.add_argument("--router-z-loss-weight", type=float, default=1e-5, help="weight for router z loss")
+parser.add_argument("--router-z-loss-input-grad-scale", type=float, default=0.1, help="scaling factor for gradients to router input when computing router z loss. Setting this to a value < 1.0 can help stabilize training by preventing large z-loss gradients from destabilizing the router input representations.")
+parser.add_argument("--z-loss-demean-logits", type=str2bool, nargs='?', const=True, default=True, help="use logits-demeaned router z loss")
+parser.add_argument("--z-loss-penalize-mean-logits", type=str2bool, nargs='?', const=True, default=True, help="penalize mean logits in router z loss")
+parser.add_argument("--aspect-ratio", type=int, default=96, help="model_dim = depth * aspect_ratio")
+parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
+parser.add_argument("--window-pattern", type=str, default="LLLL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# Training horizon (only one used, in order of precedence)
+parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
+parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
+parser.add_argument("--target-param-data-ratio", type=float, default=5, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
+parser.add_argument("--use-moe-adjusted-scaling-params", type=str2bool, nargs='?', const=True, default=True,
+                    help="use MoE-adjusted scaling params instead of raw scaling params when --target-param-data-ratio determines target tokens")
+# Optimization
+parser.add_argument("--compile", type=str2bool, nargs='?', const=True, default=True, help="use torch.compile to speed up training (may cause instability, use with caution)")
+parser.add_argument("--rebuild-compile-after-eval", type=str2bool, nargs='?', const=True, default=True, help="rebuild the compiled training wrapper after uncompiled CORE/sample passes; disable to avoid recompile overhead, but resumed training may hang")
+parser.add_argument("--rebuild-compile-after-first-eval-only", type=str2bool, nargs='?', const=True, default=False, help="experimentally rebuild the compiled training wrapper only after the first uncompiled CORE/sample pass, then reuse it afterward")
+parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
+parser.add_argument(
+    "--loss-chunk-tokens",
+    type=int,
+    default=-1,
+    help=(
+        "max tokens per lm_head/cross-entropy chunk. Use a smaller value to reduce peak "
+        "logit memory during training (-1 = auto)."
+    ),
+)
+parser.add_argument(
+    "--total-batch-size",
+    type=int,
+    default=-1,
+    help=(
+        "total batch size in tokens. Must currently be divisible by "
+        "--device-batch-size * --max-seq-len * DDP world size because each "
+        "micro-step uses a fixed-shape batch and padded rows would still "
+        "affect auxiliary MoE losses. Decent numbers are e.g. 524288. "
+        "(-1 = auto-compute optimal)"
+    ),
+)
+parser.add_argument("--max-auto-grad-accum-steps", type=int, default=64, help="cap gradient accumulation steps when --total-batch-size=-1 (-1 = disable cap)")
+parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
+parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
+parser.add_argument("--weight-decay", type=float, default=0.05, help="cautious weight decay for Transformer layer weights in the Muon optimizer")
+parser.add_argument("--matrix-lr", type=float, default=0.01, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--matrix-optimizer", type=str, default="aurora", choices=["muon", "aurora"], help="matrix optimizer for 2D parameters")
+parser.add_argument("--muon-match-rms-adamw", type=str2bool, nargs='?', const=True, default=True, help="use Kimi Muon LR scaling: 0.2*sqrt(max(out,in))")
+parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
+parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
+parser.add_argument("--lr-scheduler-skip-iters", type=int, default=0, help="number of initial iterations to skip for LR scheduling (to allow for redoing warmup when resuming from a later point in training)")
+parser.add_argument("--lr-base-scale", type=float, default=1.0, help="base scale for learning rate")
+parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
+parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
+parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
+parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+# Evaluation
+parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
+parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
+parser.add_argument("--core-metric-every", type=int, default=1000, help="evaluate CORE metric every N steps (-1 = disable)")
+parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
+parser.add_argument("--sample-every", type=int, default=-1, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--save-every", type=int, default=2000, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-optimizer-state", type=str2bool, nargs='?', const=True, default=False, help="save optimizer shards alongside model checkpoints")
+parser.add_argument("--delete-old-ckpts", type=str2bool, nargs='?', const=True, default=True, help="after saving a checkpoint, delete all older checkpoints based on step number")
+parser.add_argument("--delete-old-ckpts-before-save", action="store_true", help="delete old checkpoints before saving the new checkpoint; keeps file-size validation by snapshotting the previous checkpoint sizes first")
+parser.add_argument("--continue-to-chat-sft", type=str2bool, nargs='?', const=True, default=True, help="after a successful base training run, exec scripts.chat_sft from the final base checkpoint; when launched under torchrun, each existing worker continues in place with the same world size")
+parser.add_argument("--continue-to-chat-sft-args", type=str, default="", help="extra CLI args forwarded to scripts.chat_sft when --continue-to-chat-sft is set")
+# Output
+parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument("--wandb-api-key-file", type=str, default=None, help="Weights & Biases API key file (optional). If provided, sets WANDB_API_KEY for this run")
+parser.add_argument("--log-grad-stats", type=str2bool, nargs='?', const=True, default=True, help="log gradient statistics for MoE layers")
+parser.add_argument("--log-interval", type=int, default=20, help="interval (in steps) for logging grad stats")
+parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=False)
+
+args = parser.parse_args()
+
+if args.use_kappa_swiglu and not arg_was_explicitly_set(sys.argv[1:], '--aux-loss-weight'):
+    args.aux_loss_weight = AUX_LOSS_WEIGHT_DEFAULT / 2
+
+if args.model_tag is not None and arg_was_explicitly_set(sys.argv[1:], '--seed'):
+    args.model_tag = f"{args.model_tag}-s{args.seed}"
+if args.debug:
+    args.compile = False
+if args.rebuild_compile_after_eval and args.rebuild_compile_after_first_eval_only:
+    raise ValueError("Use only one of --rebuild-compile-after-eval or --rebuild-compile-after-first-eval-only")
+if args.compile and not args.rebuild_compile_after_eval and not args.rebuild_compile_after_first_eval_only and (args.core_metric_every > 0 or args.sample_every > 0):
+    print(
+        "Warning: --compile is enabled while --rebuild-compile-after-eval is disabled. "
+        "This avoids the recompile pause after CORE/sample, but resumed training may hang again."
+    )
+
+if args.kappa_delay_start_min_iterations < 0:
+    raise ValueError("--kappa-delay-start-min-iterations must be >= 0")
+if args.kappa_delay_start_iteration_frac < 0:
+    raise ValueError("--kappa-delay-start-iteration-frac must be >= 0")
+if not (0.0 <= args.kappa_slope_max_scale_warmup_iteration_frac <= 1.0):
+    raise ValueError("--kappa-slope-max-scale-warmup-iteration-frac must satisfy 0 <= frac <= 1")
+if args.aux_loss_weight_init_scale <= 0.0:
+    raise ValueError("--aux-loss-weight-init-scale must be > 0")
+if args.aux_loss_weight_init_anneal_iterations < 0:
+    raise ValueError("--aux-loss-weight--init-anneal-iterations must be >= 0")
+if not (0.0 <= args.kappa_l2_ema_beta < 1.0):
+    raise ValueError("--kappa-l2-ema-beta must satisfy 0 <= beta < 1")
+if not (0.0 <= args.kappa_l2_ema_anchor_start <= 1.0):
+    raise ValueError("--kappa-l2-ema-anchor-start must satisfy 0 <= start <= 1")
+if args.kappa_l2_ema_anchor_end < args.kappa_l2_ema_anchor_start:
+    raise ValueError(
+        "--kappa-l2-ema-anchor-end must be >= --kappa-l2-ema-anchor-start"
+    )
+if args.kappa_l2_ema_anchor_end > 1.0:
+    raise ValueError("--kappa-l2-ema-anchor-end must satisfy 0 <= end <= 1")
+if args.kappa_l2_ema_floor_frac < 0.0:
+    raise ValueError("--kappa-l2-ema-floor-frac must be >= 0")
+
+'''
+# Aurora and kappa-bias interact more stably when the confidence input is
+# router_probs instead of top_logits, so force that setting here.
+if args.matrix_optimizer == "aurora" and args.kappa_input != "constant":
+    args.kappa_input = "router_probs"
+'''
+
+# num_moe_layers: 
+# -1 (default): all layers from moe_start_layer
+# 0: no moe layers, i.e., a dense model
+# N: N moe layers from moe_start_layer
+if args.num_moe_layers < -1:
+    raise ValueError("--num-moe-layers must be >= -1")
+effective_moe_layer_count = len(get_moe_layer_indices(argparse.Namespace(
+    n_exp=args.n_exp,
+    num_moe_layers=args.num_moe_layers,
+    moe_start_layer=args.moe_start_layer,
+    moe_layer_stride=1,
+    n_layer=args.depth,
+)))
+if args.use_moe_adjusted_scaling_params and effective_moe_layer_count < args.depth / 5:
+    args.use_moe_adjusted_scaling_params = False
+    print(
+        "Disabling --use-moe-adjusted-scaling-params because the effective number of MoE layers "
+        f"({effective_moe_layer_count}) is less than one fifth of depth ({args.depth / 5:.2f})."
+    )
+if args.kappa_start_layer is None:
+    if args.num_moe_layers != 0:
+        # If depth = 4, start layer = 2; if depth = 6, start layer = 3;
+        # If depth = 8, start layer = 4; 
+        # if depth >= 10, start layer = 5 (capped to avoid missing too many moe layers 
+        # and reducing the benefit of kappa_bias).
+        # moe_start_layer + 2: at most skip the first 2 moe layers, 
+        # to avoid missing too many moe layers.
+        # If depth = 10 and moe_start_layer = 2, then bias starts at layer 4 instead of 5.
+        args.kappa_start_layer = min(args.moe_start_layer + 2, args.depth // 2, 5)
+    else:
+        args.kappa_start_layer = 0
+if args.kappa_start_layer < 0:
+    raise ValueError("--kappa-start-layer must be >= 0")
+if args.max_auto_grad_accum_steps != -1 and args.max_auto_grad_accum_steps < 1:
+    raise ValueError("--max-auto-grad-accum-steps must be >= 1 or -1 to disable the cap")
+if args.loss_chunk_tokens == 0 or args.loss_chunk_tokens < -1:
+    raise ValueError("--loss-chunk-tokens must be a positive integer or -1 to auto-select")
+if args.use_aux_free_load_balancing:
+    print("Disabling auxiliary router loss because --use-aux-free-load-balancing is enabled.")
+
+user_config = vars(args).copy()  # for logging
+# -----------------------------------------------------------------------------
+# Compute init and wandb logging
+
+device_type = autodetect_device_type() if args.device_type == "" else args.device_type
+# ddp is just a boolean meaning “this run was launched in distributed mode,” 
+# not “the model is wrapped in PyTorch DistributedDataParallel.”
+# The model is only assigned to orig_model and optionally passed to torch.compile; 
+# it is never wrapped in DistributedDataParallel(...).
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type, seed=args.seed)
+master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+trace_ddp_progress = args.debug or env_flag_is_true("NANOCHAT_TRACE_DDP_PROGRESS")
+abort_on_nonfinite_grad = args.debug or env_flag_is_true("NANOCHAT_ABORT_ON_NONFINITE_GRAD")
+
+
+def resolve_loss_chunk_tokens(args, ddp_world_size, vocab_size):
+    if args.loss_chunk_tokens > 0:
+        return args.loss_chunk_tokens, False
+
+    max_logit_elements = 64 * 1024 * 1024
+    # Compiled multi-GPU runs keep extra CUDA state per rank; use a smaller
+    # logits chunk to leave headroom for the chunked CE buffer.
+    if args.compile and ddp_world_size >= 4:
+        max_logit_elements //= 2
+
+    chunk_tokens = max(1, max_logit_elements // int(vocab_size))
+    return chunk_tokens, True
+
+
+def trace_rank(message):
+    if not trace_ddp_progress:
+        return
+    timestamp = time.strftime("%H:%M:%S")
+    print(f"[{timestamp}] rank {ddp_rank}/{ddp_world_size} | {message}", file=sys.stderr, flush=True)
+
+
+autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+if device_type == "cuda":
+    gpu_device_name = torch.cuda.get_device_name(0)
+    gpu_peak_flops = get_peak_flops(gpu_device_name)
+    print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+else:
+    gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+
+# wandb logging init
+use_dummy_wandb = args.mockup_mode or args.model_tag is None or not master_process
+ckpt_prefix2 = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+if args.resume_from_step != -1:
+    mat = re.search(r"(\d+)$", str(args.resume_from_step).rstrip('/'))
+    if mat:
+        ckpt_prefix2 += f"-resume{mat.group(1)}"
+
+wandb_run_name = ckpt_prefix2 + '-' + time.strftime('%Y-%m-%d %H:%M:%S')
+
+if args.wandb_api_key_file:
+    with open(args.wandb_api_key_file, "r") as f:
+        os.environ["WANDB_API_KEY"] = f.read().strip()
+
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nano-moe", name=wandb_run_name, config=user_config)
+# logging
+if not use_dummy_wandb:
+    wandb.define_metric("step")
+    wandb.define_metric("tokens_seen")
+    wandb.define_metric("train/*", step_metric="step")
+    wandb.define_metric("val/*", step_metric="step")
+
+# Flash Attention status
+if HAS_FLASH_ATTN:
+    backend_label = {
+        "fa3": "Flash Attention 3",
+        "fa4": "Flash Attention 4",
+    }.get(FLASH_ATTN_BACKEND, "Flash Attention")
+    if FLASH_ATTN_BACKEND == "fa4" and not ALLOW_FA4_TRAINING:
+        print0(f"✓ {backend_label} is available, but training defaults to PyTorch SDPA to avoid unrecoverable FA4 backward OOMs.")
+        print0("  Set NANOCHAT_ALLOW_FA4_TRAINING=1 to opt back into FA4 training.")
+    else:
+        print0(f"✓ Using {backend_label} backend.")
+else:
+    print0("!" * 80)
+    print0("WARNING: No Flash Attention backend available, using PyTorch SDPA fallback")
+    if FLASH_ATTN_UNAVAILABLE_REASON:
+        print0(f"WARNING: {FLASH_ATTN_UNAVAILABLE_REASON}")
+    print0("WARNING: Training will be less efficient without Flash Attention")
+    if any(char != "L" for char in args.window_pattern.upper()):
+        print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
+        print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
+    print0("!" * 80)
+
+# -----------------------------------------------------------------------------
+# Tokenizer will be useful for evaluation and also we need the vocab size to init the model
+tokenizer = get_tokenizer()
+token_bytes = get_token_bytes(device=device)
+vocab_size = tokenizer.get_vocab_size()
+print0(f"Vocab size: {vocab_size:,}")
+resolved_loss_chunk_tokens, auto_loss_chunk_tokens = resolve_loss_chunk_tokens(args, ddp_world_size, vocab_size)
+user_config["loss_chunk_tokens"] = resolved_loss_chunk_tokens
+if auto_loss_chunk_tokens:
+    print0(
+        "Auto-selected loss_chunk_tokens="
+        f"{resolved_loss_chunk_tokens:,} "
+        f"for vocab_size={vocab_size:,}, ddp_world_size={ddp_world_size}, compile={args.compile}"
+    )
+
+# -----------------------------------------------------------------------------
+# Initialize the Model
+
+def build_model_meta(depth):
+    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
+    # Model dim is nudged up to nearest multiple of head_dim for clean division
+    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
+    base_dim = depth * args.aspect_ratio    # 8 * 128 = 1024 for depth=8
+    # (1024 + 128 - 1) // 128 = 8; 8 * 128 = 1024
+    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
+    # 1024 // 128 = 8 heads
+    num_heads = model_dim // args.head_dim
+    config = GPTConfig(
+        sequence_len=args.max_seq_len, vocab_size=vocab_size,
+        n_layer=depth, moe_start_layer=args.moe_start_layer,
+        num_moe_layers=args.num_moe_layers,
+        n_exp=args.n_exp, moe_top_k=args.moe_top_k,
+        use_aux_loss=not args.use_aux_free_load_balancing,
+        use_aux_free_load_balancing=args.use_aux_free_load_balancing,
+        aux_loss_weight=args.aux_loss_weight,
+        use_kappa_swiglu=args.use_kappa_swiglu,
+        kappa_input=args.kappa_input,
+        kappa_input_constant=args.kappa_input_constant,
+        moe_kappa_slope_max_scale=args.moe_kappa_slope_max_scale,
+        dense_kappa_slope_max_scale=args.dense_kappa_slope_max_scale,
+        constant_kappa_bias_dense_layers=args.constant_kappa_dense_layers,
+        global_kappa_bias_granularity=args.global_kappa_granularity,
+        kappa_bias_start_layer=args.kappa_start_layer,
+        log_implicit_gate_proj_bias=args.log_implicit_gate_proj_bias,
+        kappa_bias_ema_rms_reg=args.kappa_ema_rms_reg,
+        kappa_bias_l2_ema_beta=args.kappa_l2_ema_beta,
+        kappa_bias_l2_ema_anchor_start=args.kappa_l2_ema_anchor_start,
+        kappa_bias_l2_ema_anchor_end=args.kappa_l2_ema_anchor_end,
+        kappa_bias_l2_ema_floor_frac=args.kappa_l2_ema_floor_frac,
+        bilinear_mlp_moe=args.bilinear_mlp_moe,
+        router_z_loss_weight=args.router_z_loss_weight,
+        router_z_loss_input_grad_scale=args.router_z_loss_input_grad_scale,
+        z_loss_demean_logits=args.z_loss_demean_logits,
+        z_loss_penalize_mean_logits=args.z_loss_penalize_mean_logits,
+        n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        window_pattern=args.window_pattern,
+        loss_chunk_tokens=resolved_loss_chunk_tokens,
+        debug=args.debug
+    )
+    with torch.device("meta"):
+        model_meta = GPT(config)
+    return model_meta
+
+# Build the model, move to device, init the weights
+model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+model_config = model.config
+moe_layer_indices = get_moe_layer_indices(model_config)
+model_config_kwargs = vars(model_config)
+print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
+model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
+model.init_weights() # 3) All tensors get initialized
+
+# If we are resuming, overwrite the model parameters with those of the checkpoint
+base_dir = get_base_dir()
+output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+resuming = args.resume_from_step != -1
+load_optimizer_state = False
+saved_optimizer_world_size = 0
+if resuming:
+    print0(f"Resuming optimization from {checkpoint_dir} step {args.resume_from_step}")
+    skip_optimizer_reason = None
+    model_data, _, meta_data = load_checkpoint(
+        checkpoint_dir,
+        args.resume_from_step,
+        device,
+        load_optimizer=False,
+    )
+    optimizer_shard_info = inspect_optimizer_shards(
+        checkpoint_dir,
+        args.resume_from_step,
+        saved_world_size=meta_data.get("optimizer_world_size"),
+    )
+    saved_optimizer_world_size = optimizer_shard_info["saved_world_size"]
+    load_optimizer_state = saved_optimizer_world_size > 0 and not optimizer_shard_info["missing_ranks"]
+    if saved_optimizer_world_size <= 0:
+        skip_optimizer_reason = "No optimizer checkpoint shard found; resuming with fresh optimizer state."
+    elif not load_optimizer_state:
+        skip_optimizer_reason = (
+            "Optimizer checkpoint shards are incomplete for the resume step; "
+            f"expected ranks {optimizer_shard_info['expected_ranks']}, found {optimizer_shard_info['available_ranks']}. "
+            "Resuming with fresh optimizer state."
+        )
+    elif saved_optimizer_world_size != ddp_world_size:
+        print0(
+            "Resharding optimizer state from checkpoint world size "
+            f"{saved_optimizer_world_size} to current world size {ddp_world_size}."
+        )
+    if skip_optimizer_reason is not None:
+        print0(skip_optimizer_reason)
+    model.load_state_dict(model_data, strict=True, assign=True)
+    del model_data # free up this memory after the copy
+
+# -----------------------------------------------------------------------------
+# FP8 training initialization and management (this has to be done before torch.compile)
+
+# Convert Linear layers to Float8Linear if --fp8 is set
+if args.fp8:
+    if device_type != "cuda":
+        print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
+    else:
+        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+        import torch.nn as nn
+
+        # Filter: only convert layers with dimensions divisible by 16 (FP8 hardware requirement)
+        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
+            if not isinstance(mod, nn.Linear):
+                return False
+            # FP8 requires both in_features and out_features divisible by 16
+            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+                return False
+            return True
+
+        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
+        num_fp8_layers = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
+        num_skipped = sum(1 for m in model.modules() if isinstance(m, nn.Linear)) - num_fp8_layers
+        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8_layers} layers, skipped {num_skipped} (dims not divisible by 16)")
+
+# Context manager to temporarily disable FP8 so that model evaluation remains in BF16
+@contextmanager
+def disable_fp8(model):
+    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
+
+    CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
+    we swap out Float8Linear modules entirely and restore them after.
+    """
+    import torch.nn as nn
+
+    # Find all Float8Linear modules and their locations
+    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
+    for name, module in model.named_modules():
+        if 'Float8' in type(module).__name__:
+            if '.' in name:
+                parent_name, attr_name = name.rsplit('.', 1)
+                parent = model.get_submodule(parent_name)
+            else:
+                parent = model
+                attr_name = name
+            fp8_locations.append((parent, attr_name, module))
+
+    if not fp8_locations:
+        yield  # No FP8 modules, nothing to do
+        return
+
+    # Swap Float8Linear -> nn.Linear (shares the same weight tensor, no copy)
+    for parent, attr_name, fp8_module in fp8_locations:
+        linear = nn.Linear(
+            fp8_module.in_features,
+            fp8_module.out_features,
+            bias=fp8_module.bias is not None,
+            device=fp8_module.weight.device,
+            dtype=fp8_module.weight.dtype,
+        )
+        linear.weight = fp8_module.weight  # share, don't copy
+        if fp8_module.bias is not None:
+            linear.bias = fp8_module.bias
+        setattr(parent, attr_name, linear)
+
+    try:
+        yield
+    finally:
+        # Restore Float8Linear modules
+        for parent, attr_name, fp8_module in fp8_locations:
+            setattr(parent, attr_name, fp8_module)
+
+# -----------------------------------------------------------------------------
+# Compile the model
+
+orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+
+
+def build_training_model(orig_model, compile_enabled):
+    if not compile_enabled:
+        return orig_model
+    if hasattr(torch, "_dynamo"):
+        torch._dynamo.reset()
+    return torch.compile(orig_model, dynamic=False,
+                         options={"triton.cudagraphs": False})
+
+
+def get_compile_rebuild_plan(
+    compile_enabled,
+    rebuild_after_eval,
+    rebuild_after_first_eval_only,
+    has_rebuilt_compile_after_eval,
+):
+    if not compile_enabled:
+        return False, False
+    if rebuild_after_eval:
+        return False, True
+    if rebuild_after_first_eval_only and not has_rebuilt_compile_after_eval:
+        return False, True
+    return False, False
+
+model = build_training_model(orig_model, args.compile)
+
+# -----------------------------------------------------------------------------
+# Determine the optimization horizon based on the model size
+# The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
+# We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
+
+# Get the parameter counts of the model
+param_counts = model.num_scaling_params()
+print0(f"Parameter counts:")
+for key, value in param_counts.items():
+    print0(f"{key:24s}: {value:,}")
+active_param_count = model.get_num_active_params(args.n_exp, args.moe_top_k)
+print0(f"Active parameters: {active_param_count:,}")
+num_params = param_counts['total']
+num_flops_per_token = model.estimate_flops()
+print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+
+# Scaling params: transformer matrices + lm_head (gives cleanest scaling laws, see dev/LOG.md Jan 27, 2026)
+num_scaling_params = param_counts['transformer_matrices'] + param_counts['lm_head']
+moe_adjusted_scaling_params = model.get_moe_adjusted_scaling_params(args.n_exp, args.moe_top_k)
+print0(f"MoE-adjusted scaling parameters: {int(moe_adjusted_scaling_params):,}")
+target_scaling_params = moe_adjusted_scaling_params if args.use_moe_adjusted_scaling_params else num_scaling_params
+target_scaling_params_label = "MoE-adjusted scaling params" if args.use_moe_adjusted_scaling_params else "scaling params"
+print0(f"Using {target_scaling_params_label} for --target-param-data-ratio: {int(target_scaling_params):,}")
+target_tokens = int(args.target_param_data_ratio * target_scaling_params)
+tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
+world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
+
+# Auto-compute optimal batch size based on Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
+total_batch_size = args.total_batch_size
+if total_batch_size == -1:
+    d12_ref = build_model_meta(12) # d12 is where the optimal batch size was measured to be 2**19 tokens
+    d12_moe_adjusted_scaling_params = d12_ref.get_moe_adjusted_scaling_params(args.n_exp, args.moe_top_k)
+    d12_target_scaling_params = d12_moe_adjusted_scaling_params if args.use_moe_adjusted_scaling_params else (
+        d12_ref.num_scaling_params()['transformer_matrices'] + d12_ref.num_scaling_params()['lm_head']
+    )
+    D_REF = args.target_param_data_ratio * d12_target_scaling_params
+    B_REF = 2**19
+    batch_size_ratio = target_tokens / D_REF
+    total_batch_size = 2 ** round(math.log2(B_REF * batch_size_ratio ** 0.383)) # also clamp to power of 2
+    print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
+    if args.max_auto_grad_accum_steps != -1:
+        max_auto_total_batch_size = world_tokens_per_fwdbwd * args.max_auto_grad_accum_steps
+        if total_batch_size > max_auto_total_batch_size:
+            print0(
+                "Auto-computed total_batch_size would require too many gradient accumulation steps; "
+                f"capping from {total_batch_size:,} to {max_auto_total_batch_size:,} "
+                f"to respect --max-auto-grad-accum-steps={args.max_auto_grad_accum_steps}."
+            )
+            total_batch_size = max_auto_total_batch_size
+
+# Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
+assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
+if args.num_iterations > 0:
+    # Override num_iterations to a specific value if given
+    num_iterations = args.num_iterations
+    print0(f"Using user-provided number of iterations: {num_iterations:,}")
+elif args.target_flops > 0:
+    # Calculate the number of iterations from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
+    num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_size))
+    print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
+elif args.target_param_data_ratio > 0:
+    # Calculate the number of iterations from the target param data ratio (the most common use case)
+    num_iterations = target_tokens // total_batch_size
+    print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
+else:
+    raise ValueError("No training horizon specified")
+total_tokens = total_batch_size * num_iterations
+print0(f"Total number of training tokens: {total_tokens:,}")
+print0(f"Tokens : {target_scaling_params_label} ratio: {total_batch_size * num_iterations / target_scaling_params:.2f}") # Chinchilla is ~20
+print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+orig_model.set_kappa_bias_ema_rms_reg_total_iterations(num_iterations)
+
+kappa_bias_delay_start_iterations = max(
+    args.kappa_delay_start_min_iterations,
+    math.ceil(num_iterations * args.kappa_delay_start_iteration_frac),
+)
+user_config["effective_kappa_delay_start_iterations"] = kappa_bias_delay_start_iterations
+print0(
+    "Using kappa_bias LR delay start iterations: "
+    f"max({args.kappa_delay_start_min_iterations}, "
+    f"ceil({num_iterations} * {args.kappa_delay_start_iteration_frac:.6f})) "
+    f"= {kappa_bias_delay_start_iterations}"
+)
+
+# -----------------------------------------------------------------------------
+# Optimizer / data / training length related hyperparameters
+# figure out the needed gradient accumulation to reach the desired total batch size
+if total_batch_size % world_tokens_per_fwdbwd != 0:
+    if args.total_batch_size == -1:
+        # Auto batch size might not be divisible by world_tokens_per_fwdbwd.
+        rounded = round(total_batch_size / world_tokens_per_fwdbwd) * world_tokens_per_fwdbwd
+        if rounded == 0:
+            rounded = world_tokens_per_fwdbwd
+        print0(
+            "Auto-computed total_batch_size isn't divisible by world_tokens_per_fwdbwd; "
+            f"adjusting from {total_batch_size:,} to {rounded:,}."
+        )
+        total_batch_size = rounded
+    else:
+        raise ValueError(
+            "total_batch_size must be a multiple of world_tokens_per_fwdbwd "
+            "(= --device-batch-size * --max-seq-len * DDP world size). "
+            f"Got total_batch_size={total_batch_size:,}, world_tokens_per_fwdbwd={world_tokens_per_fwdbwd:,}. "
+            "This script currently uses fixed-shape micro-batches, and simply padding the "
+            "remainder would change auxiliary/router losses instead of only masking the LM loss. "
+            "Adjust --total-batch-size, --device-batch-size, --max-seq-len, or DDP world size."
+        )
+    
+grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
+print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
+print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
+print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
+# Batch size scaling for learning rates (hyperparameters were tuned at reference batch size 2^19)
+batch_lr_scale = 1.0
+reference_batch_size = 2**19
+batch_ratio = total_batch_size / reference_batch_size
+if batch_ratio != 1.0:
+    # SGD: linear scaling with batch size is standard (not used in nanochat)
+    # AdamW: sqrt scaling is standard
+    # Muon: sqrt scaling is an assumption - not fully studied, but it's a second-order-ish optimizer
+    batch_lr_scale = batch_ratio ** 0.5
+    print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {reference_batch_size:,})")
+
+# Weight decay is tuned at d12 and its scaling seems to be \propto 1/channels^2 (or equivalently, \propto 1/depth^2 due to constant aspect ratio)
+weight_decay_scaled = args.weight_decay * (12 / args.depth)**2
+if args.depth != 12:
+    print0(
+        f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} "
+        f"for depth {args.depth}"
+    )
+
+# -----------------------------------------------------------------------------
+# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# After setup_optimizer(), one shouldn't change parameter-group LR scaling settings.
+adam_betas = (args.adam_beta1, args.adam_beta2)
+optimizer = model.setup_optimizer(
+    unembedding_lr=args.unembedding_lr * batch_lr_scale,
+    embedding_lr=args.embedding_lr * batch_lr_scale,
+    matrix_lr=args.matrix_lr * batch_lr_scale,
+    matrix_optimizer=args.matrix_optimizer,
+    weight_decay=weight_decay_scaled,
+    adam_betas=adam_betas,
+    scalar_lr=args.scalar_lr * batch_lr_scale,
+    muon_match_rms_adamw=args.muon_match_rms_adamw,
+    kappa_bias_lr_final_scale=args.kappa_lr_final_scale,
+    kappa_bias_lr_max_scale=args.kappa_lr_max_scale,
+    kappa_bias_delay_start_iterations=kappa_bias_delay_start_iterations,
+    kappa_bias_lr_warmup_iterations=args.kappa_lr_warmup_iterations,
+)
+
+if resuming and load_optimizer_state:
+    optimizer_state_dict = load_optimizer_state_dict(
+        checkpoint_dir,
+        args.resume_from_step,
+        optimizer,
+        device,
+        rank=ddp_rank,
+        current_world_size=ddp_world_size,
+        saved_world_size=saved_optimizer_world_size,
+    )
+    optimizer.load_state_dict(optimizer_state_dict)
+    del optimizer_state_dict
+
+# -----------------------------------------------------------------------------
+# Initialize the DataLoaders for train/val
+dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+
+# -----------------------------------------------------------------------------
+# Set up hyperparameter schedulers
+
+# Learning rate scheduler
+def get_lr_multiplier(it, num_iterations, warmup_ratio, warmdown_ratio, 
+                      final_lr_frac, lr_scheduler_skip_iters=0, lr_base_scale=1.0):
+    it = max(0, it - lr_scheduler_skip_iters) # allow skipping the LR scheduler for the first N iterations (useful for redoing warmup when resuming from a later point in training)
+    num_iterations = max(1, num_iterations - lr_scheduler_skip_iters) # avoid division by zero or negative iterations
+    warmup_iters = round(warmup_ratio * num_iterations)
+    warmdown_iters = round(warmdown_ratio * num_iterations)
+    if it < warmup_iters:
+        return lr_base_scale * (it + 1) / warmup_iters
+    elif it <= num_iterations - warmdown_iters:
+        return lr_base_scale * 1.0
+    else:
+        progress = (num_iterations - it) / warmdown_iters
+        return lr_base_scale * (progress * 1.0 + (1 - progress) * final_lr_frac)
+
+# Momentum scheduler for Muon optimizer
+def get_muon_momentum(it):
+    frac = min(it / 300, 1)
+    momentum = (1 - frac) * 0.85 + frac * 0.95
+    return momentum
+
+# Weight decay scheduler for Muon optimizer (linear to zero over the course of training)
+def get_weight_decay(base_weight_decay, it, num_iterations):
+    return base_weight_decay * (1 - it / num_iterations)
+
+
+def get_annealed_loss_weight(base_weight, it, num_anneal_iterations=500, final_weight=1e-3):
+    if num_anneal_iterations <= 0 or base_weight <= final_weight:
+        return final_weight if base_weight <= final_weight else base_weight
+
+    anneal_progress = min(max(it, 0), num_anneal_iterations) / num_anneal_iterations
+    return base_weight + (final_weight - base_weight) * anneal_progress
+
+
+def get_two_stage_annealed_loss_weight(base_weight, it, total_iterations, stage1_iterations=-1, stage1_floor_frac=0.1, final_floor_frac=0.01, nolearn_iterations=0):
+    total_iterations = max(int(total_iterations), 1)
+    effective_nolearn_iterations = min(max(int(nolearn_iterations), 0), total_iterations)
+    if it < effective_nolearn_iterations:
+        return 0.0
+
+    effective_total_iterations = max(total_iterations - effective_nolearn_iterations, 1)
+    effective_it = min(max(int(it) - effective_nolearn_iterations, 0), effective_total_iterations)
+    if stage1_iterations <= 0:
+        stage1_iterations = max((effective_total_iterations + 1) // 2, 1)
+    stage1_iterations = min(max(int(stage1_iterations), 0), effective_total_iterations)
+
+    if stage1_iterations > 0 and effective_it <= stage1_iterations:
+        stage1_progress = min(max(effective_it, 0), stage1_iterations) / stage1_iterations
+        stage1_multiplier = stage1_floor_frac + (1.0 - stage1_floor_frac) * (1.0 - stage1_progress)
+        return base_weight * stage1_multiplier
+
+    if stage1_iterations >= effective_total_iterations:
+        return base_weight * stage1_floor_frac
+
+    stage2_iterations = effective_total_iterations - stage1_iterations
+    stage2_step = effective_it - stage1_iterations
+    stage2_progress = min(max(stage2_step, 0), stage2_iterations) / stage2_iterations
+    stage2_multiplier = final_floor_frac + (stage1_floor_frac - final_floor_frac) * (1.0 - stage2_progress)
+    return base_weight * stage2_multiplier
+
+
+def get_linear_lr_scale(it, num_iterations, end_scale=1.0, max_scale=1.0, warmup_iterations=1000, nolearn_iterations=0):
+    num_iterations = max(0, num_iterations)
+    effective_nolearn_iterations = min(max(0, nolearn_iterations), num_iterations)
+    effective_warmup_iterations = min(max(0, warmup_iterations), max(0, num_iterations - effective_nolearn_iterations))
+    it = min(max(it, 0), num_iterations)
+
+    if it < effective_nolearn_iterations:
+        return 0.0
+
+    warmup_step = it - effective_nolearn_iterations
+    if effective_warmup_iterations > 0 and warmup_step < effective_warmup_iterations:
+        return max_scale * warmup_step / effective_warmup_iterations
+
+    remaining_iterations = num_iterations - effective_nolearn_iterations - effective_warmup_iterations
+    if remaining_iterations <= 0:
+        return max_scale
+
+    decay_progress = min(max(warmup_step - effective_warmup_iterations, 0), remaining_iterations) / remaining_iterations
+    return max_scale + (end_scale - max_scale) * decay_progress
+
+
+def get_kappa_bias_lr_scale(optimizer, step, num_iterations):
+    for group in optimizer.param_groups:
+        if group.get("name") == "kappa_bias" and group.get("kind") == "adamw":
+            return get_linear_lr_scale(
+                step,
+                num_iterations,
+                end_scale=group.get("lr_scale_end", 1.0),
+                max_scale=group.get("lr_scale_max", 1.0),
+                nolearn_iterations=group.get("lr_scale_nolearn_iterations", 0),
+                warmup_iterations=group.get("lr_scale_warmup_iterations", 1000),
+            )
+    return 1.0
+
+
+def get_kappa_slope_max_scale(target_max_scale, it, total_iterations, warmup_iteration_frac=0.1, delay_iterations=0):
+    import math
+
+    target_max_scale = float(target_max_scale)
+    if target_max_scale == 1.0:
+        return 1.0
+
+    delay_iterations = max(int(delay_iterations), 0)
+    if int(it) < delay_iterations:
+        return 1.0
+
+    warmup_iteration_frac = min(max(float(warmup_iteration_frac), 0.0), 1.0)
+    warmup_iterations = math.ceil(max(int(total_iterations), 0) * warmup_iteration_frac)
+    if warmup_iterations <= 0:
+        return target_max_scale
+
+    warmup_step = min(max(int(it) - delay_iterations, 0), warmup_iterations)
+    progress = warmup_step / warmup_iterations
+    return 1.0 + (target_max_scale - 1.0) * progress
+
+def scalar_loss_to_item(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().item()
+    return float(value)
+
+
+def drop_none_log_values(log_data):
+    return {key: value for key, value in log_data.items() if value is not None}
+
+def accumulate_step_losses(step_losses, micro_losses):
+    """Accumulate detached per-microstep losses for step-level logging."""
+    if step_losses is None:
+        step_losses = {}
+
+    for key, value in micro_losses.items():
+        if value is None:
+            step_losses.setdefault(key, None)
+            continue
+
+        if torch.is_tensor(value):
+            detached_value = value.detach()
+            if key not in step_losses or step_losses[key] is None:
+                step_losses[key] = detached_value.clone()
+            else:
+                step_losses[key].add_(detached_value)
+        else:
+            if key not in step_losses or step_losses[key] is None:
+                step_losses[key] = value
+            else:
+                step_losses[key] += value
+
+    return step_losses
+
+def average_step_losses(step_losses, grad_accum_steps):
+    """Average accumulated losses across microsteps."""
+    averaged_losses = {}
+    for key, value in step_losses.items():
+        if value is None:
+            averaged_losses[key] = None
+        elif torch.is_tensor(value):
+            averaged_losses[key] = value / grad_accum_steps
+        else:
+            averaged_losses[key] = value / grad_accum_steps
+    return averaged_losses
+
+def get_dense_kappa_bias_stat_layer_indices(model):
+    start_layer = max(0, int(getattr(model.config, 'kappa_bias_start_layer', 0)))
+    return [
+        layer_idx
+        for layer_idx in range(start_layer, len(model.transformer.h))
+        if not hasattr(model.transformer.h[layer_idx].mlp, 'experts')
+        and bool(getattr(model.transformer.h[layer_idx].mlp, 'use_kappa_swiglu', False))
+    ]
+
+def snapshot_exp_gate_implicit_bias_signs(model, moe_layer_indices):
+    sign_snapshots = {}
+    with torch.inference_mode():
+        for layer_idx in moe_layer_indices:
+            layer = model.transformer.h[layer_idx]
+            experts = getattr(layer.mlp, 'experts', None)
+            if experts is None:
+                continue
+            router_weight = layer.mlp.router.w_g.weight.float()  # [n_exp, d_model]
+            exp_gate_weight = experts.gate_proj.float()  # [n_exp, d_model, intermediate_size]
+            normalized_router_weight = torch.nn.functional.normalize(router_weight, dim=1, eps=1e-12)
+            normalized_exp_gate_weight = torch.nn.functional.normalize(exp_gate_weight, dim=1, eps=1e-12)
+            implicit_bias = (normalized_exp_gate_weight * normalized_router_weight.unsqueeze(2)).sum(dim=1)
+            sign_snapshots[layer_idx] = torch.sign(implicit_bias).to(device='cpu', dtype=torch.int8)
+    return sign_snapshots
+
+def collect_exp_gate_implicit_bias_flip_rates(model, moe_layer_indices, previous_sign_snapshots, losses):
+    current_sign_snapshots = snapshot_exp_gate_implicit_bias_signs(model, moe_layer_indices)
+    for layer_idx, current_signs in current_sign_snapshots.items():
+        previous_signs = previous_sign_snapshots.get(layer_idx)
+        if previous_signs is None or previous_signs.shape != current_signs.shape:
+            continue
+        losses[f'exp_gate_implicit_bias_flip_rate_{layer_idx}'] = current_signs.ne(previous_signs).float().mean().item()
+    return current_sign_snapshots
+
+def collect_weight_grad_stats(model, losses, moe_layer_indices):
+    # weight: [n_exp, n_rows, row_dim]
+    # returns: [n_exp, n_rows], the ratio of the mean component to the overall norm 
+    # for each row. Higher means more of the row is aligned with the mean direction.
+    def compute_row_mean_component_ratio(weight):
+        weight = weight.float()
+        row_dim = weight.shape[2]
+        row_means = weight.mean(dim=2)
+        row_mean_component_norm = row_means.abs() * (row_dim ** 0.5)
+        row_norm = weight.norm(dim=2).clamp_min(1e-12)
+        return row_mean_component_norm / row_norm
+
+    def mean_top_bottom_frac(values, frac=0.05):
+        flat_values = values.reshape(-1)
+        if flat_values.numel() == 0:
+            return None, None
+        count = max(1, math.ceil(flat_values.numel() * frac))
+        top_mean = torch.topk(flat_values, k=count, largest=True).values.mean()
+        bottom_mean = torch.topk(flat_values, k=count, largest=False).values.mean()
+        return top_mean, bottom_mean
+
+    def mean_by_sign(values, reduce_dims, sign):
+        values = values.float()
+        if sign == 'positive':
+            mask = values > 0
+        elif sign == 'negative':
+            mask = values < 0
+        else:
+            raise ValueError(f"Unsupported sign selector: {sign}")
+        counts = mask.sum(dim=reduce_dims)
+        sums = values.masked_fill(~mask, 0).sum(dim=reduce_dims)
+        means = sums / counts.clamp_min(1)
+        return means.masked_fill(counts == 0, float('nan'))
+
+    def finite_mean_item(values):
+        finite_values = values[torch.isfinite(values)]
+        if finite_values.numel() == 0:
+            return None
+        return finite_values.mean().item()
+
+    router_grad_norms = []
+    router_row_norms = []
+    router_grad_self_alignments = []
+    router_weight_exp_gate_alignments = []
+    gate_proj_row_mean_component_ratios = []
+    exp_gate_grad_norms = []
+    expert_utilities = losses.get('expert_utilities', None)
+    selected_scores = losses.get('selected_scores', None)
+    moe_layer_to_stats_idx = {layer_idx: stats_idx for stats_idx, layer_idx in enumerate(moe_layer_indices)}
+
+    for i in moe_layer_indices:
+        layer = model.transformer.h[i]
+        if hasattr(layer.mlp, 'experts'):
+            # [n_exp, hidden_size]
+            router_gate_grad = layer.mlp.router.w_g.weight.grad
+            router_grad_norm = router_gate_grad.norm(dim=1)
+            router_grad_norms.append(router_grad_norm)
+            losses[f'router_grad_norm_{i}'] = router_grad_norm.mean().item()
+            exp_gate_grad = layer.mlp.experts.gate_proj.grad
+            exp_gate_grad_norm = None if exp_gate_grad is None else torch.linalg.vector_norm(
+                exp_gate_grad,
+                dim=tuple(range(1, exp_gate_grad.ndim)),
+            )
+            if exp_gate_grad_norm is not None:
+                exp_gate_grad_norms.append(exp_gate_grad_norm)
+                losses[f'exp_gate_grad_norm_{i}'] = exp_gate_grad_norm.mean().item()
+
+            # Compute router grad - router weight alignment.
+            # Compute router weight alignment against expert projections.
+            with torch.inference_mode():
+                router_weight = layer.mlp.router.w_g.weight  # [n_exp, hidden_size]
+                router_row_norm = router_weight.norm(dim=1)
+                router_row_norms.append(router_row_norm)
+                losses[f'router_row_norm_{i}'] = router_row_norm.mean().item()
+                experts = layer.mlp.experts
+                exp_gate_weight = experts.gate_proj
+                gate_proj_row_mean_component_ratio = compute_row_mean_component_ratio(exp_gate_weight).mean(dim=1)
+                gate_proj_row_mean_component_ratios.append(gate_proj_row_mean_component_ratio)
+                losses[f'gate_proj_row_mean_component_ratio_{i}'] = gate_proj_row_mean_component_ratio.mean().item()
+                if experts.use_kappa_swiglu:
+                    exp_kappa_bias = experts._materialize_kappa_bias()
+                    losses[f'kappa_bias_mean_{i}'] = exp_kappa_bias.mean().float().item()
+                    losses[f'kappa_bias_abs_mean_{i}'] = exp_kappa_bias.abs().mean().float().item()
+                if experts.use_kappa_scale:
+                    exp_kappa_scale = experts._materialize_kappa_scale()
+                    losses[f'kappa_scale_mean_{i}'] = exp_kappa_scale.mean().float().item()
+                    losses[f'kappa_scale_abs_mean_{i}'] = exp_kappa_scale.abs().mean().float().item()
+                exp_gate_mean_weight = exp_gate_weight.mean(dim=2)  # [n_exp, hidden_size]
+                # Compute the cosine similarity between router weights and router weight grads.
+                # With SGD: Δw = -lr * ∇w. Since w·Δw = -lr*(w·∇w),
+                # -(w·∇w) is positive when the update has a component along w (tends to increase ||w||),
+                # and negative when it moves against w (tends to decrease ||w||). 
+                rg_rw_alignment = -(router_gate_grad * router_weight).sum(dim=1) / (
+                    router_weight.norm(dim=1) * router_gate_grad.norm(dim=1) + 1e-10
+                )  # [n_exp]
+                router_grad_self_alignments.append(rg_rw_alignment)
+                mean_rg_rw_alignment = rg_rw_alignment.mean().item()
+                losses[f'router_grad_self_alignment_{i}'] = mean_rg_rw_alignment
+
+                # No negative sign here since these are weights, not gradients.
+                rw_ew_alignment = (exp_gate_mean_weight * router_weight).sum(dim=1) / \
+                        (router_weight.norm(dim=1) * (exp_gate_mean_weight.norm(dim=1) + 1e-10)) # [n_exp]
+                router_weight_exp_gate_alignments.append(rw_ew_alignment)
+                mean_rw_ew_alignment = rw_ew_alignment.mean().item()
+                losses[f'router_weight_exp_gate_alignment_{i}'] = mean_rw_ew_alignment
+
+                exp_gate_weight_alignment = (exp_gate_weight * router_weight.unsqueeze(2)).sum(dim=1) / (
+                    router_weight.norm(dim=1, keepdim=True)
+                    * exp_gate_weight.norm(dim=1).clamp_min(1e-10)
+                )  # [n_exp, intermediate_size]
+                top_exp_gate_weight_alignment, bottom_exp_gate_weight_alignment = mean_top_bottom_frac(
+                    exp_gate_weight_alignment,
+                    frac=0.05,
+                )
+                losses[f'router_weight_exp_gate_alignment_top5p_{i}'] = top_exp_gate_weight_alignment.item()
+                losses[f'router_weight_exp_gate_alignment_bottom5p_{i}'] = bottom_exp_gate_weight_alignment.item()
+
+                router_weight_unit = torch.nn.functional.normalize(router_weight, dim=1, eps=1e-12)
+                exp_gate_parallel = (exp_gate_weight * router_weight_unit.unsqueeze(2)).sum(dim=1, keepdim=True)
+                exp_gate_orthogonal = exp_gate_weight - router_weight_unit.unsqueeze(2) * exp_gate_parallel
+
+                if expert_utilities is not None:
+                    # expert_utilities: Tensor of shape (num_moe_layers, n_exp)
+                    exp_utilities = expert_utilities[moe_layer_to_stats_idx[i]]  # [n_exp]
+                    half_experts = exp_utilities.shape[0] // 2
+                    top_indices    = torch.topk(exp_utilities, k=half_experts, largest=True).indices
+                    bottom_indices = torch.topk(exp_utilities, k=half_experts, largest=False).indices
+
+                    if experts.use_kappa_swiglu:
+                        reduce_dims = tuple(range(1, exp_kappa_bias.ndim))
+                        exp_kappa_bias_mean = exp_kappa_bias.float().mean(dim=reduce_dims)
+                        exp_kappa_bias_abs_mean = exp_kappa_bias.abs().float().mean(dim=reduce_dims)
+                        exp_kappa_bias_positive_mean = mean_by_sign(exp_kappa_bias, reduce_dims, sign='positive')
+                        exp_kappa_bias_negative_mean = mean_by_sign(exp_kappa_bias, reduce_dims, sign='negative')
+                        losses[f'kappa_bias_mean_top_{i}'] = exp_kappa_bias_mean[top_indices].mean().item()
+                        losses[f'kappa_bias_mean_bottom_{i}'] = exp_kappa_bias_mean[bottom_indices].mean().item()
+                        losses[f'kappa_bias_abs_mean_top_{i}'] = exp_kappa_bias_abs_mean[top_indices].mean().item()
+                        losses[f'kappa_bias_abs_mean_bottom_{i}'] = exp_kappa_bias_abs_mean[bottom_indices].mean().item()
+                        losses[f'kappa_bias_positive_mean_top_{i}'] = finite_mean_item(exp_kappa_bias_positive_mean[top_indices])
+                        losses[f'kappa_bias_positive_mean_bottom_{i}'] = finite_mean_item(exp_kappa_bias_positive_mean[bottom_indices])
+                        losses[f'kappa_bias_negative_mean_top_{i}'] = finite_mean_item(exp_kappa_bias_negative_mean[top_indices])
+                        losses[f'kappa_bias_negative_mean_bottom_{i}'] = finite_mean_item(exp_kappa_bias_negative_mean[bottom_indices])
+                    if experts.use_kappa_scale:
+                        reduce_dims = tuple(range(1, exp_kappa_scale.ndim))
+                        exp_kappa_scale_mean = exp_kappa_scale.float().mean(dim=reduce_dims)
+                        exp_kappa_scale_abs_mean = exp_kappa_scale.abs().float().mean(dim=reduce_dims)
+                        exp_kappa_scale_positive_mean = mean_by_sign(exp_kappa_scale, reduce_dims, sign='positive')
+                        exp_kappa_scale_negative_mean = mean_by_sign(exp_kappa_scale, reduce_dims, sign='negative')
+                        losses[f'kappa_scale_mean_top_{i}'] = exp_kappa_scale_mean[top_indices].mean().item()
+                        losses[f'kappa_scale_mean_bottom_{i}'] = exp_kappa_scale_mean[bottom_indices].mean().item()
+                        losses[f'kappa_scale_abs_mean_top_{i}'] = exp_kappa_scale_abs_mean[top_indices].mean().item()
+                        losses[f'kappa_scale_abs_mean_bottom_{i}'] = exp_kappa_scale_abs_mean[bottom_indices].mean().item()
+                        losses[f'kappa_scale_positive_mean_top_{i}'] = finite_mean_item(exp_kappa_scale_positive_mean[top_indices])
+                        losses[f'kappa_scale_positive_mean_bottom_{i}'] = finite_mean_item(exp_kappa_scale_positive_mean[bottom_indices])
+                        losses[f'kappa_scale_negative_mean_top_{i}'] = finite_mean_item(exp_kappa_scale_negative_mean[top_indices])
+                        losses[f'kappa_scale_negative_mean_bottom_{i}'] = finite_mean_item(exp_kappa_scale_negative_mean[bottom_indices])
+
+                    top_rg_rw_alignment    = rg_rw_alignment[top_indices].mean().item()
+                    bottom_rg_rw_alignment = rg_rw_alignment[bottom_indices].mean().item()
+                    losses[f'router_grad_self_alignment_top_{i}']    = top_rg_rw_alignment
+                    losses[f'router_grad_self_alignment_bottom_{i}'] = bottom_rg_rw_alignment
+
+                    top_rw_ew_alignment    = rw_ew_alignment[top_indices].mean().item()
+                    bottom_rw_ew_alignment = rw_ew_alignment[bottom_indices].mean().item()
+                    losses[f'router_weight_exp_gate_alignment_top_{i}']    = top_rw_ew_alignment
+                    losses[f'router_weight_exp_gate_alignment_bottom_{i}'] = bottom_rw_ew_alignment
+
+                    top_router_grad_norm    = router_grad_norm[top_indices].mean().item()
+                    bottom_router_grad_norm = router_grad_norm[bottom_indices].mean().item()
+                    losses[f'router_grad_norm_top_{i}']    = top_router_grad_norm
+                    losses[f'router_grad_norm_bottom_{i}'] = bottom_router_grad_norm
+
+                    top_router_row_norm = router_row_norm[top_indices].mean().item()
+                    bottom_router_row_norm = router_row_norm[bottom_indices].mean().item()
+                    losses[f'router_row_norm_top_{i}'] = top_router_row_norm
+                    losses[f'router_row_norm_bottom_{i}'] = bottom_router_row_norm
+
+                    if selected_scores is not None:
+                        # selected_scores: Tensor of shape (num_moe_layers, n_exp)
+                        layer_selected_scores = selected_scores[moe_layer_to_stats_idx[i]]  # [n_exp]
+                        top_selected_scores    = layer_selected_scores[top_indices].mean().item()
+                        bottom_selected_scores = layer_selected_scores[bottom_indices].mean().item()
+                        losses[f'selected_scores_top_{i}']    = top_selected_scores
+                        losses[f'selected_scores_bottom_{i}'] = bottom_selected_scores
+
+    for i in get_dense_kappa_bias_stat_layer_indices(model):
+        layer = model.transformer.h[i]
+        mlp = getattr(layer, 'mlp', None)
+        if hasattr(mlp, 'experts'):
+            continue
+        gate_proj_weight = getattr(mlp.gate_proj, 'weight', None)
+        if gate_proj_weight is not None:
+            dense_gate_proj_weight = gate_proj_weight.transpose(0, 1).unsqueeze(0)
+            gate_proj_row_mean_component_ratio = compute_row_mean_component_ratio(dense_gate_proj_weight)
+            losses[f'gate_proj_row_mean_component_ratio_{i}'] = gate_proj_row_mean_component_ratio.mean().item()
+        kappa_bias = getattr(mlp, 'kappa_bias', None)
+        if kappa_bias is not None:
+            losses[f'kappa_bias_mean_{i}'] = kappa_bias.mean().float().item()
+            losses[f'kappa_bias_abs_mean_{i}'] = kappa_bias.abs().mean().float().item()
+
+    router_grad_norms = torch.stack(router_grad_norms, dim=0) if router_grad_norms else None
+    losses['router_grad_norms'] = router_grad_norms
+    router_row_norms = torch.stack(router_row_norms, dim=0) if router_row_norms else None
+    losses['router_row_norms'] = router_row_norms
+    router_grad_self_alignments = torch.stack(router_grad_self_alignments, dim=0) if router_grad_self_alignments else None
+    losses['router_grad_self_alignments'] = router_grad_self_alignments
+    router_weight_exp_gate_alignments = torch.stack(router_weight_exp_gate_alignments, dim=0) if router_weight_exp_gate_alignments else None
+    losses['router_weight_exp_gate_alignments'] = router_weight_exp_gate_alignments
+    gate_proj_row_mean_component_ratios = torch.stack(gate_proj_row_mean_component_ratios, dim=0) if gate_proj_row_mean_component_ratios else None
+    losses['gate_proj_row_mean_component_ratios'] = gate_proj_row_mean_component_ratios
+    exp_gate_grad_norms = torch.stack(exp_gate_grad_norms, dim=0) if exp_gate_grad_norms else None
+    losses['exp_gate_grad_norms'] = exp_gate_grad_norms
+
+# -----------------------------------------------------------------------------
+# Loop state (variables updated by the training loop)
+
+if not resuming:
+    step = 0
+    val_bpb = None # will be set if eval_every > 0
+    min_val_bpb = float("inf")
+    smooth_train_loss = 0 # EMA of training loss
+    total_training_time = 0 # total wall-clock time of training
+    last_core_eval_step = None
+else:
+    step = meta_data["step"]
+    loop_state = meta_data["loop_state"]
+    val_bpb = meta_data["val_bpb"]
+    min_val_bpb = loop_state["min_val_bpb"]
+    smooth_train_loss = loop_state["smooth_train_loss"]
+    total_training_time = loop_state["total_training_time"]
+    last_core_eval_step = loop_state.get("last_core_eval_step")
+    if last_core_eval_step is not None:
+        last_core_eval_step = int(last_core_eval_step)
+    else:
+        last_core_eval_step = infer_last_completed_core_eval_step(
+            checkpoint_dir,
+            step,
+            args.core_metric_every,
+        )
+        if last_core_eval_step is not None:
+            print0(
+                f"Recovered last completed CORE evaluation checkpoint from checkpoint directory: "
+                f"step {last_core_eval_step:06d}."
+            )
+
+if args.mockup_mode:
+    print0("Mockup mode enabled: skipping training/eval/sample compute and only advancing steps.")
+
+core_results = {}
+prev_exp_gate_implicit_bias_signs = {}
+has_rebuilt_compile_after_eval = False
+
+signal.signal(signal.SIGTERM, handle_shutdown_signal)
+signal.signal(signal.SIGINT, handle_shutdown_signal)
+if hasattr(signal, "SIGUSR1"):
+    signal.signal(signal.SIGUSR1, handle_shutdown_signal)
+if hasattr(signal, "SIGHUP"):
+    signal.signal(signal.SIGHUP, handle_shutdown_signal)
+
+# -----------------------------------------------------------------------------
+# Training loop
+while True:
+    is_last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    should_terminate_after_checkpoint = shutdown_requested and not is_last_step
+    refresh_compiled_training_model = False
+    run_eager_training_step_after_core_eval = False
+    tokens_seen = total_batch_size * step
+    flops_so_far = num_flops_per_token * tokens_seen
+    aux_loss_weight = get_annealed_loss_weight(
+        args.aux_loss_weight * args.aux_loss_weight_init_scale,
+        step,
+        num_anneal_iterations=args.aux_loss_weight_init_anneal_iterations,
+        final_weight=args.aux_loss_weight,
+    )
+    # By default, stage1_iterations = kappa_l2_loss_anneal_iterations = -1.
+    # In this case, it's set as half of the total iterations in 
+    # get_two_stage_annealed_loss_weight().
+    kappa_bias_l2_stage1_iterations = args.kappa_l2_loss_anneal_iterations
+    kappa_bias_l2_loss_weight = get_two_stage_annealed_loss_weight(
+        args.kappa_l2_loss_weight,
+        step,
+        total_iterations=num_iterations,
+        stage1_iterations=kappa_bias_l2_stage1_iterations,
+        stage1_floor_frac=args.kappa_l2_loss_stage1_frac,
+        final_floor_frac=args.kappa_l2_loss_final_frac,
+        nolearn_iterations=0,
+    )
+    kappa_scale_l2_loss_weight = (
+        kappa_bias_l2_loss_weight * args.kappa_scale_l2_loss_weight_scale
+    )
+    moe_kappa_slope_max_scale = get_kappa_slope_max_scale(
+        args.moe_kappa_slope_max_scale,
+        step,
+        total_iterations=num_iterations,
+        warmup_iteration_frac=args.kappa_slope_max_scale_warmup_iteration_frac,
+        delay_iterations=kappa_bias_delay_start_iterations,
+    )
+    dense_kappa_slope_max_scale = get_kappa_slope_max_scale(
+        args.dense_kappa_slope_max_scale,
+        step,
+        total_iterations=num_iterations,
+        warmup_iteration_frac=args.kappa_slope_max_scale_warmup_iteration_frac,
+        delay_iterations=kappa_bias_delay_start_iterations,
+    )
+    orig_model.set_kappa_slope_max_scales(
+        moe_kappa_slope_max_scale=moe_kappa_slope_max_scale,
+        dense_kappa_slope_max_scale=dense_kappa_slope_max_scale,
+    )
+
+    # once in a while: evaluate the val bpb (all ranks participate)
+    if (not should_terminate_after_checkpoint) and (not args.mockup_mode) and args.eval_every > 0 and (is_last_step or (step > 0 and step % args.eval_every == 0)):
+        model.eval()
+        val_loader = build_val_loader()
+        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+        with disable_fp8(model), autocast_ctx:
+            # val_bpb: Compute summed loss over targets, but normalize by the number of bytes 
+            # of the target text, not tokens.
+            val_bpb, ntp_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+        if val_bpb < min_val_bpb:
+            min_val_bpb = val_bpb
+        wandb_run.log(drop_none_log_values({
+            "step": step,
+            "tokens_seen": tokens_seen,
+            "total_training_flops": flops_so_far,
+            "total_training_time": total_training_time,
+            "val/bpb": val_bpb,
+            "val/loss": ntp_loss,
+        }), step=step)
+        model.train()
+        MANAGER.reset_all()
+
+    # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
+    if should_terminate_after_checkpoint and master_process:
+        signal_label = shutdown_signal_name or "shutdown signal"
+        print0(f"{signal_label} received; saving checkpoint at step {step:06d} before exit.")
+
+    if should_terminate_after_checkpoint or is_last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        expected_optimizer_ranks = range(ddp_world_size) if args.save_optimizer_state else None
+        checkpoint_save_failed = False
+        checkpoint_save_error = ""
+        delete_old_ckpts_failed = False
+        delete_old_ckpts_error = ""
+        comparison_step = None
+        reference_file_sizes = None
+        keep_checkpoint_steps = [last_core_eval_step]
+        if args.delete_old_ckpts and args.delete_old_ckpts_before_save and master_process:
+            try:
+                comparison_step, reference_file_sizes = snapshot_checkpoint_file_sizes(
+                    checkpoint_dir,
+                    step,
+                    expected_optimizer_ranks=expected_optimizer_ranks,
+                )
+                delete_old_checkpoints(checkpoint_dir, step, keep_steps=keep_checkpoint_steps)
+            except ValueError as exc:
+                delete_old_ckpts_failed = True
+                delete_old_ckpts_error = str(exc)
+                print0(delete_old_ckpts_error)
+                
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            orig_model.state_dict(), # model parameters
+            optimizer.state_dict() if args.save_optimizer_state else None, # optimizer state
+            { # metadata saved as json
+                "step": step,
+                "val_bpb": val_bpb, # loss at last step
+                "model_config": model_config_kwargs,
+                "user_config": user_config, # inputs to the training script
+                "device_batch_size": args.device_batch_size,
+                "max_seq_len": args.max_seq_len,
+                "optimizer_world_size": ddp_world_size if args.save_optimizer_state else 0,
+                "dataloader_state_dict": dataloader_state_dict,
+                "loop_state": { # all loop state (other than step) so that we can resume training
+                    "min_val_bpb": min_val_bpb,
+                    "smooth_train_loss": smooth_train_loss,
+                    "total_training_time": total_training_time,
+                    "last_core_eval_step": last_core_eval_step,
+                },
+            },
+            rank=ddp_rank,
+        )
+        if ddp:
+            torch.distributed.barrier()
+        if args.delete_old_ckpts and master_process and not delete_old_ckpts_failed:
+            try:
+                if args.delete_old_ckpts_before_save:
+                    if comparison_step is None:
+                        print0(
+                            f"Skipped checkpoint file size validation at step {step}: "
+                            "no prior checkpoint with matching file layout was found for file-size validation."
+                        )
+                    else:
+                        validate_checkpoint_file_sizes(
+                            checkpoint_dir,
+                            step,
+                            expected_optimizer_ranks=expected_optimizer_ranks,
+                            comparison_step=comparison_step,
+                            reference_file_sizes=reference_file_sizes,
+                        )
+                else:
+                    comparison_step = validate_checkpoint_file_sizes(
+                        checkpoint_dir,
+                        step,
+                        expected_optimizer_ranks=expected_optimizer_ranks,
+                    )
+                    if comparison_step is None:
+                        print0(
+                            f"Skipping old checkpoint deletion at step {step}: "
+                            "no prior checkpoint with matching file layout was found for file-size validation."
+                        )
+                    else:
+                        delete_old_checkpoints(checkpoint_dir, step, keep_steps=keep_checkpoint_steps)
+            except ValueError as exc:
+                checkpoint_save_failed = True
+                checkpoint_save_error = str(exc)
+                print0(
+                    f"{checkpoint_save_error} Removing checkpoint files for step {step:06d} and continuing training."
+                )
+        if ddp:
+            checkpoint_save_status = torch.tensor(
+                [1 if checkpoint_save_failed else 0],
+                device=device,
+                dtype=torch.int32,
+            )
+            torch.distributed.broadcast(checkpoint_save_status, src=0)
+            checkpoint_save_failed = bool(checkpoint_save_status.item())
+        if checkpoint_save_failed:
+            delete_checkpoint_step(checkpoint_dir, step)
+            if ddp:
+                torch.distributed.barrier()
+        if delete_old_ckpts_failed:
+            if master_process:
+                raise ValueError(delete_old_ckpts_error)
+            raise RuntimeError(
+                f"Checkpoint deletion failed on rank 0 at step {step}. See rank 0 logs for details."
+            )
+        if should_terminate_after_checkpoint:
+            break
+
+    # once in a while: estimate the CORE metric (all ranks participate)
+    # use the original uncompiled model because the inputs keep changing shape
+    # disable FP8 for evaluation to use BF16 for more consistent/accurate results
+
+    if (not should_terminate_after_checkpoint) and (not args.mockup_mode) and args.core_metric_every > 0 and (is_last_step or (step > 0 and step % args.core_metric_every == 0)):
+        model.eval()
+        with disable_fp8(orig_model), autocast_ctx:
+            # for the final evaluation at the end of training, run on the full set of tasks instead of a subset            
+            max_per_task = args.core_metric_max_per_task if not is_last_step else -1 
+            core_results = evaluate_core(orig_model, tokenizer, device, max_per_task=max_per_task)
+        core_metric = core_results["core_metric"]
+        print0(f"Step {step:05d} | CORE metric: {core_metric:.4f}")
+        print0(f"Step {step:05d} | CORE metric (no boolq): {core_results['core_metric_no_boolq']:.4f}")
+        wandb_run.log(drop_none_log_values({
+            "step": step,
+            "tokens_seen": tokens_seen,
+            "total_training_flops": flops_so_far,
+            "core_metric": core_metric,
+            "core_metric_no_boolq": core_results["core_metric_no_boolq"],
+            "centered_results": core_results["centered_results"],
+        }), step=step)
+        last_core_eval_step = step
+        model.train()
+        MANAGER.reset_all()
+        refresh_compiled_training_model, run_eager_training_step_after_core_eval = get_compile_rebuild_plan(
+            args.compile,
+            args.rebuild_compile_after_eval,
+            args.rebuild_compile_after_first_eval_only,
+            has_rebuilt_compile_after_eval,
+        )
+
+        # For the final evaluation at the end of training, write CSV output
+        if is_last_step and ddp_rank == 0:
+            model_slug = f"{output_dirname}_base_{step:06d}"
+            output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
+            os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+            with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
+                f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
+                for label in core_results["results"]:
+                    acc = core_results["results"][label]
+                    centered = core_results["centered_results"][label]
+                    f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}\n")
+                f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}\n")
+                f.write(f"{'CORE (no boolq)':<35}, {'':<10}, {core_results['core_metric_no_boolq']:<10.6f}\n")
+            if not use_dummy_wandb:
+                artifact = wandb.Artifact(
+                    name=f"{model_slug}-core-eval",
+                    type="core-eval-results",
+                    metadata={
+                        "model_slug": model_slug,
+                        "step": step,
+                        "core_metric": core_results["core_metric"],
+                        "core_metric_no_boolq": core_results["core_metric_no_boolq"],
+                    },
+                )
+                artifact.add_file(output_csv_path, name=os.path.basename(output_csv_path))
+                wandb_run.log_artifact(artifact)
+            print0(f"\nResults written to: {output_csv_path}")
+            print0(f"CORE metric: {core_results['core_metric']:.4f}")
+            print0(f"CORE metric (no boolq): {core_results['core_metric_no_boolq']:.4f}")
+
+    # once in a while: sample from the model (only on master process)
+    # use the original uncompiled model because the inputs keep changing shape
+    should_sample = (
+        (not should_terminate_after_checkpoint)
+        and (not args.mockup_mode)
+        and args.sample_every > 0
+        and (is_last_step or (step > 0 and step % args.sample_every == 0))
+    )
+    if should_sample:
+        if ddp:
+            trace_rank(f"step {step}: waiting at pre-sample barrier")
+            torch.distributed.barrier()
+            trace_rank(f"step {step}: passed pre-sample barrier")
+        if master_process:
+            trace_rank(f"step {step}: starting master-only sampling")
+            model.eval()
+            sample_block_start = time.perf_counter()
+            prompts = [
+                "The capital of France is",
+                "The chemical symbol of gold is",
+                "If yesterday was Friday, then tomorrow will be",
+                "The opposite of hot is",
+                "The planets of the solar system are:",
+                "My favorite color is",
+                "If 5*x + 3 = 13, then x is",
+            ]
+            engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+            for prompt in prompts:
+                prompt_start = time.perf_counter()
+                tokens = tokenizer(prompt, prepend="<|bos|>")
+                with disable_fp8(orig_model), autocast_ctx:
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                prompt_elapsed = time.perf_counter() - prompt_start
+                print0(f"sample prompt took {prompt_elapsed:.2f}s: {prompt}")
+                print0(tokenizer.decode(sample[0]))
+            sample_block_elapsed = time.perf_counter() - sample_block_start
+            print0(f"master-only sampling finished in {sample_block_elapsed:.2f}s")
+            model.train()
+            MANAGER.reset_all()
+            trace_rank(f"step {step}: finished master-only sampling")
+            refresh_compiled_training_model, run_eager_training_step_after_core_eval = get_compile_rebuild_plan(
+                args.compile,
+                args.rebuild_compile_after_eval,
+                args.rebuild_compile_after_first_eval_only,
+                has_rebuilt_compile_after_eval,
+            )
+        if ddp:
+            trace_rank(f"step {step}: waiting at post-sample barrier")
+            post_sample_barrier_start = time.perf_counter()
+            torch.distributed.barrier()
+            if master_process:
+                post_sample_barrier_elapsed = time.perf_counter() - post_sample_barrier_start
+                print0(f"post-sample barrier passed in {post_sample_barrier_elapsed:.2f}s")
+            trace_rank(f"step {step}: passed post-sample barrier")
+
+    if refresh_compiled_training_model:
+        trace_rank(f"step {step}: rebuilding compiled training wrapper")
+        rebuild_start = time.perf_counter()
+        orig_model.train()
+        model = build_training_model(orig_model, args.compile)
+        has_rebuilt_compile_after_eval = True
+        rebuild_elapsed = time.perf_counter() - rebuild_start
+        print0(f"compiled training wrapper rebuilt in {rebuild_elapsed:.2f}s")
+        trace_rank(f"step {step}: rebuilt compiled training wrapper")
+
+    # termination conditions (TODO: possibly also add loss explosions etc.)
+    if is_last_step:
+        break
+
+    MANAGER.collect_load_balancing_stats = args.log_grad_stats and (step % args.log_interval == 0)
+    MANAGER.collect_backward_stats = False
+
+    # -------------------------------------------------------------------------
+    # single training step
+    # evaluate the gradient
+    if args.mockup_mode:
+        lrm = get_lr_multiplier(step, num_iterations, args.warmup_ratio, args.warmdown_ratio, 
+                                args.final_lr_frac, lr_scheduler_skip_iters=args.lr_scheduler_skip_iters, 
+                                lr_base_scale=args.lr_base_scale)
+        losses = {
+            'ntp_loss': 0.0,
+            'aux_loss': 0.0,
+            'router_z_loss': 0.0,
+            'kappa_bias_l2_loss': 0.0,
+            'kappa_scale_l2_loss': 0.0,
+            'kappa_bias_ema_rms_reg_loss': 0.0,
+            'kappa_scale_ema_rms_reg_loss': 0.0,
+            'kappa_bias_shift_abs_mean': 0.0,
+            'drop_rate_per_ks': None,
+        }
+        train_loss_f = 0.0
+        dt = 1.0
+    else:
+        if should_sample or refresh_compiled_training_model or run_eager_training_step_after_core_eval:
+            print0("resuming training after eval/sample")
+            print0("about to synchronize before resumed training step")
+        trace_rank(f"step {step}: entering training step")
+        trace_rank(f"step {step}: synchronizing before timer")
+        synchronize()
+        if should_sample or refresh_compiled_training_model or run_eager_training_step_after_core_eval:
+            print0("finished synchronize before resumed training step")
+        trace_rank(f"step {step}: synchronize before timer complete")
+        t0 = time.time()
+        step_losses = None
+        training_model = model
+        orig_model.set_kappa_bias_ema_rms_reg_step(step)
+        kappa_bias_lr_scale = get_kappa_bias_lr_scale(optimizer, step, num_iterations)
+        for micro_step in range(grad_accum_steps):
+            current_training_model = (
+                orig_model
+                if run_eager_training_step_after_core_eval and micro_step == 0
+                else training_model
+            )
+            MANAGER.collect_backward_stats = (
+                MANAGER.collect_load_balancing_stats and micro_step == grad_accum_steps - 1
+            )
+            if micro_step == 0 or micro_step == grad_accum_steps - 1:
+                trace_rank(f"step {step}: micro_step {micro_step + 1}/{grad_accum_steps} starting forward")
+            if (should_sample or refresh_compiled_training_model or run_eager_training_step_after_core_eval) and micro_step == 0:
+                print0("starting first resumed forward")
+                if run_eager_training_step_after_core_eval:
+                    print0("running first post-CORE training step eagerly before returning to compiled training")
+            with autocast_ctx:
+                loss, micro_losses = current_training_model(x, y)
+            if (should_sample or refresh_compiled_training_model or run_eager_training_step_after_core_eval) and micro_step == 0:
+                print0("finished first resumed forward")
+            step_losses = accumulate_step_losses(step_losses, micro_losses)
+            aux_loss = micro_losses.get("aux_loss")
+            if aux_loss is None:
+                aux_loss = 0.0
+            loss = loss + aux_loss_weight * aux_loss
+            kappa_bias_l2_loss = micro_losses.get("kappa_bias_l2_loss")
+            if kappa_bias_l2_loss is None:
+                kappa_bias_l2_loss = 0.0
+            kappa_scale_l2_loss = micro_losses.get("kappa_scale_l2_loss")
+            if kappa_scale_l2_loss is None:
+                kappa_scale_l2_loss = 0.0
+            kappa_bias_ema_rms_reg_loss = micro_losses.get("kappa_bias_ema_rms_reg_loss")
+            if kappa_bias_ema_rms_reg_loss is None:
+                kappa_bias_ema_rms_reg_loss = 0.0
+            kappa_scale_ema_rms_reg_loss = micro_losses.get("kappa_scale_ema_rms_reg_loss")
+            if kappa_scale_ema_rms_reg_loss is None:
+                kappa_scale_ema_rms_reg_loss = 0.0
+            loss = loss + kappa_bias_l2_loss_weight * kappa_bias_l2_loss
+            loss = loss + kappa_scale_l2_loss_weight * kappa_scale_l2_loss
+            loss = loss + kappa_bias_l2_loss_weight * kappa_bias_ema_rms_reg_loss
+            loss = loss + kappa_scale_l2_loss_weight * kappa_scale_ema_rms_reg_loss
+            
+            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            if micro_step == 0 or micro_step == grad_accum_steps - 1:
+                trace_rank(f"step {step}: micro_step {micro_step + 1}/{grad_accum_steps} starting backward")
+            if (should_sample or refresh_compiled_training_model or run_eager_training_step_after_core_eval) and micro_step == 0:
+                print0("starting first resumed backward")
+            loss.backward()
+            if (should_sample or refresh_compiled_training_model or run_eager_training_step_after_core_eval) and micro_step == 0:
+                print0("finished first resumed backward")
+            if run_eager_training_step_after_core_eval and micro_step == 0:
+                trace_rank(f"step {step}: rebuilding compiled training wrapper after eager recovery micro-step")
+                rebuild_start = time.perf_counter()
+                orig_model.train()
+                model = build_training_model(orig_model, args.compile)
+                training_model = model
+                has_rebuilt_compile_after_eval = True
+                rebuild_elapsed = time.perf_counter() - rebuild_start
+                print0(f"compiled training wrapper rebuilt in {rebuild_elapsed:.2f}s")
+                trace_rank(f"step {step}: rebuilt compiled training wrapper after eager recovery micro-step")
+            if abort_on_nonfinite_grad:
+                grad_issue = find_first_nonfinite_grad(orig_model)
+                if grad_issue is not None:
+                    grad_name, grad_index, grad_value = grad_issue
+                    loss_snapshot = summarize_loss_snapshot(loss, micro_losses)
+                    raise RuntimeError(
+                        f"Non-finite gradient detected before optimizer.step at step={step}, micro_step={micro_step}. "
+                        f"name={grad_name} index={grad_index} value={grad_value}. "
+                        f"loss_snapshot={loss_snapshot}"
+                    )
+            MANAGER.collect_backward_stats = False
+            if micro_step == 0 or micro_step == grad_accum_steps - 1:
+                trace_rank(f"step {step}: micro_step {micro_step + 1}/{grad_accum_steps} fetching next batch")
+            x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+            if micro_step == 0 or micro_step == grad_accum_steps - 1:
+                trace_rank(f"step {step}: micro_step {micro_step + 1}/{grad_accum_steps} fetched next batch")
+
+        losses = average_step_losses(step_losses, grad_accum_steps)
+
+        if MANAGER.collect_load_balancing_stats:
+            collect_weight_grad_stats(model, losses, moe_layer_indices)
+        
+        # step the optimizer
+        lrm = get_lr_multiplier(step, num_iterations, args.warmup_ratio, args.warmdown_ratio, 
+                                args.final_lr_frac, lr_scheduler_skip_iters=args.lr_scheduler_skip_iters, 
+                                lr_base_scale=args.lr_base_scale)
+        muon_momentum = get_muon_momentum(step)
+        for group in optimizer.param_groups:
+                if group.get("name") == "kappa_bias" and group['kind'] == 'adamw':
+                    group["lr"] = group.get("base_lr", group["initial_lr"]) * lrm * kappa_bias_lr_scale
+                else:
+                    group["lr"] = group["initial_lr"] * lrm
+                if group['kind'] == 'muon':
+                    group["momentum"] = muon_momentum
+                group["weight_decay"] = get_weight_decay(group["initial_weight_decay"], step, num_iterations)
+        orig_model.update_aux_free_load_balancing()
+        trace_rank(f"step {step}: starting optimizer.step()")
+        optimizer.step()
+        trace_rank(f"step {step}: finished optimizer.step()")
+        model.zero_grad(set_to_none=True)
+        trace_rank(f"step {step}: converting ntp_loss to host scalar")
+        train_loss_f = losses['ntp_loss'].item() # .item() is a CPU-GPU sync point
+        trace_rank(f"step {step}: ntp_loss host scalar ready")
+        trace_rank(f"step {step}: synchronizing after optimizer")
+        synchronize()
+        trace_rank(f"step {step}: synchronize after optimizer complete")
+        t1 = time.time()
+        dt = t1 - t0
+    # -------------------------------------------------------------------------
+
+    # logging (CPU action only)
+    ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
+    # We don't do EMA on other types of losses. Just the main NTP loss.
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    pct_done = 100 * step / num_iterations
+    tok_per_sec = int(total_batch_size / dt)
+    flops_per_sec = num_flops_per_token * total_batch_size / dt
+    mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
+    if step > 10:
+        total_training_time += dt # only count the time after the first 10 steps
+    # Calculate ETA based on average time per step (excluding first 10 steps)
+    steps_done = step - 10
+    if steps_done > 0:
+        avg_time_per_step = total_training_time / steps_done
+        remaining_steps = num_iterations - step
+        eta_seconds = remaining_steps * avg_time_per_step
+        eta_str = f" | eta: {eta_seconds/60:.1f}m"
+    else:
+        eta_str = ""
+    epoch = dataloader_state_dict["epoch"]
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    if step % args.log_interval == 0:
+        prev_exp_gate_implicit_bias_signs = collect_exp_gate_implicit_bias_flip_rates(
+            orig_model,
+            moe_layer_indices,
+            prev_exp_gate_implicit_bias_signs,
+            losses,
+        )
+        log_data = {
+            "step": step,
+            "tokens_seen": tokens_seen,
+            "total_training_flops": flops_so_far,
+            "total_training_time": total_training_time,
+            "train/loss_step":              debiased_smooth_loss,
+            "train/aux_loss_step":          losses['aux_loss'],
+            "train/router_z_loss_step":     losses['router_z_loss'],
+            "train/kappa_bias_l2_loss_step": losses['kappa_bias_l2_loss'],
+            "train/kappa_scale_l2_loss_step": losses['kappa_scale_l2_loss'],
+            "train/kappa_bias_ema_rms_reg_loss_step": losses['kappa_bias_ema_rms_reg_loss'],
+            "train/kappa_scale_ema_rms_reg_loss_step": losses['kappa_scale_ema_rms_reg_loss'],
+            "train/kappa_bias_shift_abs_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_mean'].mean()),
+            "train/kappa_bias_shift_abs_top5p_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_top5p_mean'].mean()),
+            "train/kappa_bias_shift_abs_bottom5p_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_bottom5p_mean'].mean()),
+            "train/kappa_bias_shift_abs_mean_normalized_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_mean_normalized'].mean()),
+            "train/implicit_gate_proj_bias_top5p_mean_step": scalar_loss_to_item(losses['implicit_gate_proj_bias_top5p_mean'].mean()),
+            "train/implicit_gate_proj_bias_bottom5p_mean_step": scalar_loss_to_item(losses['implicit_gate_proj_bias_bottom5p_mean'].mean()),
+            "train/routed_token_router_weight_cosine_mean_step": scalar_loss_to_item(losses['routed_token_router_weight_cosine_mean'].mean()),
+            "train/routed_token_router_weight_cosine_top5p_mean_step": scalar_loss_to_item(losses['routed_token_router_weight_cosine_top5p_mean'].mean()),
+            "train/routed_token_router_weight_cosine_bottom5p_mean_step": scalar_loss_to_item(losses['routed_token_router_weight_cosine_bottom5p_mean'].mean()),
+            "train/kappa_bias_lr_scale": kappa_bias_lr_scale,
+            "lrm": lrm,
+            "dt": dt,
+            "tok_per_sec": tok_per_sec,
+            "mfu": mfu,
+            "epoch": epoch,
+        }
+        log_data["train/aux_loss_weight"] = aux_loss_weight
+        log_data["train/kappa_bias_l2_loss_weight"] = kappa_bias_l2_loss_weight
+        log_data["train/kappa_scale_l2_loss_weight"] = kappa_scale_l2_loss_weight
+        log_data["train/moe_kappa_slope_max_scale"] = moe_kappa_slope_max_scale
+        log_data["train/dense_kappa_slope_max_scale"] = dense_kappa_slope_max_scale
+        drop_rates = losses['drop_rate_per_ks']
+        if drop_rates is not None:
+            if drop_rates.shape[1] >= 1:
+                log_data["inspect/drop_rate_0_step"] = drop_rates[:, 0].mean()
+            if drop_rates.shape[1] >= 2:
+                log_data["inspect/drop_rate_1_step"] = drop_rates[:, 1].mean()
+                
+            for stats_idx, layer_idx in enumerate(moe_layer_indices):
+                if stats_idx >= drop_rates.shape[0] or drop_rates.shape[1] < 2:
+                    continue
+                log_data[f"inspect/drop_rate_1_step_{layer_idx}"] = scalar_loss_to_item(
+                    drop_rates[stats_idx, 1]
+                )
+        expert_utilities = losses['expert_utilities']
+        moe_layer_to_stats_idx = {layer_idx: stats_idx for stats_idx, layer_idx in enumerate(moe_layer_indices)}
+        for i in moe_layer_indices:
+            if expert_utilities is not None:
+                layer_expert_utilities = expert_utilities[moe_layer_to_stats_idx[i]]
+                log_data.update({f"inspect/expert_utility_min_{i}": layer_expert_utilities.min().item()})
+                log_data.update({f"inspect/expert_utility_mean_{i}": layer_expert_utilities.mean().item()})
+            if f'router_row_norm_{i}' in losses:
+                log_data.update({f"inspect/router_row_norm_{i}": losses[f'router_row_norm_{i}']})
+            if f'gate_proj_row_mean_component_ratio_{i}' in losses:
+                log_data.update({f"inspect/gate_proj_row_mean_component_ratio_{i}": losses[f'gate_proj_row_mean_component_ratio_{i}']})
+            if f'kappa_bias_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_mean_{i}": losses[f'kappa_bias_mean_{i}']})
+            if f'kappa_bias_abs_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_abs_mean_{i}": losses[f'kappa_bias_abs_mean_{i}']})
+            if f'kappa_scale_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_scale_mean_{i}": losses[f'kappa_scale_mean_{i}']})
+            if f'kappa_scale_abs_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_scale_abs_mean_{i}": losses[f'kappa_scale_abs_mean_{i}']})
+            if f'kappa_bias_mean_top_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_mean_top_{i}": losses[f'kappa_bias_mean_top_{i}']})
+            if f'kappa_bias_mean_bottom_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_mean_bottom_{i}": losses[f'kappa_bias_mean_bottom_{i}']})
+            if f'kappa_bias_abs_mean_top_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_abs_mean_top_{i}": losses[f'kappa_bias_abs_mean_top_{i}']})
+            if f'kappa_bias_abs_mean_bottom_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_abs_mean_bottom_{i}": losses[f'kappa_bias_abs_mean_bottom_{i}']})
+            if f'kappa_bias_positive_mean_top_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_positive_mean_top_{i}": losses[f'kappa_bias_positive_mean_top_{i}']})
+            if f'kappa_bias_positive_mean_bottom_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_positive_mean_bottom_{i}": losses[f'kappa_bias_positive_mean_bottom_{i}']})
+            if f'kappa_bias_negative_mean_top_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_negative_mean_top_{i}": losses[f'kappa_bias_negative_mean_top_{i}']})
+            if f'kappa_bias_negative_mean_bottom_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_negative_mean_bottom_{i}": losses[f'kappa_bias_negative_mean_bottom_{i}']})
+            if f'kappa_scale_mean_top_{i}' in losses:
+                log_data.update({f"inspect/kappa_scale_mean_top_{i}": losses[f'kappa_scale_mean_top_{i}']})
+            if f'kappa_scale_mean_bottom_{i}' in losses:
+                log_data.update({f"inspect/kappa_scale_mean_bottom_{i}": losses[f'kappa_scale_mean_bottom_{i}']})
+            if f'kappa_scale_abs_mean_top_{i}' in losses:
+                log_data.update({f"inspect/kappa_scale_abs_mean_top_{i}": losses[f'kappa_scale_abs_mean_top_{i}']})
+            if f'kappa_scale_abs_mean_bottom_{i}' in losses:
+                log_data.update({f"inspect/kappa_scale_abs_mean_bottom_{i}": losses[f'kappa_scale_abs_mean_bottom_{i}']})
+            if f'kappa_scale_positive_mean_top_{i}' in losses:
+                log_data.update({f"inspect/kappa_scale_positive_mean_top_{i}": losses[f'kappa_scale_positive_mean_top_{i}']})
+            if f'kappa_scale_positive_mean_bottom_{i}' in losses:
+                log_data.update({f"inspect/kappa_scale_positive_mean_bottom_{i}": losses[f'kappa_scale_positive_mean_bottom_{i}']})
+            if f'kappa_scale_negative_mean_top_{i}' in losses:
+                log_data.update({f"inspect/kappa_scale_negative_mean_top_{i}": losses[f'kappa_scale_negative_mean_top_{i}']})
+            if f'kappa_scale_negative_mean_bottom_{i}' in losses:
+                log_data.update({f"inspect/kappa_scale_negative_mean_bottom_{i}": losses[f'kappa_scale_negative_mean_bottom_{i}']})
+            if f'kappa_bias_shift_abs_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_shift_abs_mean_{i}": losses[f'kappa_bias_shift_abs_mean_{i}']})
+            if f'kappa_bias_shift_abs_top5p_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_shift_abs_top5p_mean_{i}": losses[f'kappa_bias_shift_abs_top5p_mean_{i}']})
+            if f'kappa_bias_shift_abs_bottom5p_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_shift_abs_bottom5p_mean_{i}": losses[f'kappa_bias_shift_abs_bottom5p_mean_{i}']})
+            if f'kappa_bias_shift_abs_mean_normalized_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_shift_abs_mean_normalized_{i}": losses[f'kappa_bias_shift_abs_mean_normalized_{i}']})
+            if f'implicit_gate_proj_bias_top5p_mean_{i}' in losses:
+                log_data.update({f"inspect/implicit_gate_proj_bias_top5p_mean_{i}": losses[f'implicit_gate_proj_bias_top5p_mean_{i}']})
+            if f'implicit_gate_proj_bias_bottom5p_mean_{i}' in losses:
+                log_data.update({f"inspect/implicit_gate_proj_bias_bottom5p_mean_{i}": losses[f'implicit_gate_proj_bias_bottom5p_mean_{i}']})
+            if f'routed_token_router_weight_cosine_mean_{i}' in losses:
+                log_data.update({f"inspect/routed_token_router_weight_cosine_mean_{i}": losses[f'routed_token_router_weight_cosine_mean_{i}']})
+            if f'routed_token_router_weight_cosine_top5p_mean_{i}' in losses:
+                log_data.update({f"inspect/routed_token_router_weight_cosine_top5p_mean_{i}": losses[f'routed_token_router_weight_cosine_top5p_mean_{i}']})
+            if f'routed_token_router_weight_cosine_bottom5p_mean_{i}' in losses:
+                log_data.update({f"inspect/routed_token_router_weight_cosine_bottom5p_mean_{i}": losses[f'routed_token_router_weight_cosine_bottom5p_mean_{i}']})
+            if f'exp_gate_implicit_bias_flip_rate_{i}' in losses:
+                log_data.update({f"inspect/exp_gate_implicit_bias_flip_rate_{i}": losses[f'exp_gate_implicit_bias_flip_rate_{i}']})
+            if f'mean_abs_gate_{i}' in losses:
+                log_data.update({f"inspect/mean_abs_gate_{i}": losses[f'mean_abs_gate_{i}']})
+            if f'active_frac_gate_{i}' in losses:
+                log_data.update({f"inspect/active_frac_gate_{i}": losses[f'active_frac_gate_{i}']})
+            if f'topk_share_gate_{i}' in losses:
+                log_data.update({f"inspect/topk_share_gate_{i}": losses[f'topk_share_gate_{i}']})
+            if f'entropy_gate_{i}' in losses:
+                log_data.update({f"inspect/entropy_gate_{i}": losses[f'entropy_gate_{i}']})
+            if f'router_weight_exp_gate_alignment_{i}' in losses:
+                log_data.update({f"inspect/router_weight_exp_gate_alignment_{i}": losses[f'router_weight_exp_gate_alignment_{i}']})
+            if f'router_weight_exp_gate_alignment_top5p_{i}' in losses:
+                log_data.update({f"inspect/router_weight_exp_gate_alignment_top5p_{i}": losses[f'router_weight_exp_gate_alignment_top5p_{i}']})
+            if f'router_weight_exp_gate_alignment_bottom5p_{i}' in losses:
+                log_data.update({f"inspect/router_weight_exp_gate_alignment_bottom5p_{i}": losses[f'router_weight_exp_gate_alignment_bottom5p_{i}']})
+            if f'router_grad_norm_top_{i}' in losses:
+                log_data.update({f"inspect/router_grad_norm_top_{i}": losses[f'router_grad_norm_top_{i}']})
+            if f'router_grad_norm_bottom_{i}' in losses:
+                log_data.update({f"inspect/router_grad_norm_bottom_{i}": losses[f'router_grad_norm_bottom_{i}']})
+            if f'router_row_norm_top_{i}' in losses:
+                log_data.update({f"inspect/router_row_norm_top_{i}": losses[f'router_row_norm_top_{i}']})
+            if f'router_row_norm_bottom_{i}' in losses:
+                log_data.update({f"inspect/router_row_norm_bottom_{i}": losses[f'router_row_norm_bottom_{i}']})
+            if f'router_grad_self_alignment_top_{i}' in losses:
+                log_data.update({f"inspect/router_grad_self_alignment_top_{i}": losses[f'router_grad_self_alignment_top_{i}']})
+            if f'router_grad_self_alignment_bottom_{i}' in losses:
+                log_data.update({f"inspect/router_grad_self_alignment_bottom_{i}": losses[f'router_grad_self_alignment_bottom_{i}']})
+            if f'router_weight_exp_gate_alignment_top_{i}' in losses:
+                log_data.update({f"inspect/router_weight_exp_gate_alignment_top_{i}": losses[f'router_weight_exp_gate_alignment_top_{i}']})
+            if f'router_weight_exp_gate_alignment_bottom_{i}' in losses:
+                log_data.update({f"inspect/router_weight_exp_gate_alignment_bottom_{i}": losses[f'router_weight_exp_gate_alignment_bottom_{i}']})
+            if f'selected_scores_top_{i}' in losses:
+                log_data.update({f"inspect/selected_scores_top_{i}": losses[f'selected_scores_top_{i}']})
+            if f'selected_scores_bottom_{i}' in losses:
+                log_data.update({f"inspect/selected_scores_bottom_{i}": losses[f'selected_scores_bottom_{i}']})
+
+        for i in get_dense_kappa_bias_stat_layer_indices(orig_model):
+            if f'gate_proj_row_mean_component_ratio_{i}' in losses:
+                log_data.update({f"inspect/gate_proj_row_mean_component_ratio_{i}": losses[f'gate_proj_row_mean_component_ratio_{i}']})
+            if f'kappa_bias_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_mean_{i}": losses[f'kappa_bias_mean_{i}']})
+            if f'kappa_bias_abs_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_abs_mean_{i}": losses[f'kappa_bias_abs_mean_{i}']})
+            if f'kappa_bias_shift_abs_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_shift_abs_mean_{i}": losses[f'kappa_bias_shift_abs_mean_{i}']})
+            if f'kappa_bias_shift_abs_top5p_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_shift_abs_top5p_mean_{i}": losses[f'kappa_bias_shift_abs_top5p_mean_{i}']})
+            if f'kappa_bias_shift_abs_bottom5p_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_shift_abs_bottom5p_mean_{i}": losses[f'kappa_bias_shift_abs_bottom5p_mean_{i}']})
+            if f'kappa_bias_shift_abs_mean_normalized_{i}' in losses:
+                log_data.update({f"inspect/kappa_bias_shift_abs_mean_normalized_{i}": losses[f'kappa_bias_shift_abs_mean_normalized_{i}']})
+                        
+        wandb_run.log(drop_none_log_values(log_data), step=step)
+
+    # state update
+    first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
+    step += 1
+
+    # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
+    # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
+    # So we manually manage and help it out here
+    if first_step_of_run:
+        gc.collect() # manually collect a lot of garbage from setup
+        gc.freeze() # immediately freeze all currently surviving objects and exclude them from GC
+        gc.disable() # nuclear intervention here: disable GC entirely except:
+    elif step % 5000 == 0: # every 5000 steps...
+        gc.collect() # manually collect, just to be safe for very, very long runs
+
+# print a few more stats
+print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
+print0(f"Total training time: {total_training_time/60:.2f}m")
+if val_bpb is not None:
+    print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+
+# Log to report
+from nanochat.report import get_report
+get_report().log(section="Base model training", data=[
+    user_config, # CLI args
+    { # stats about the training setup
+        "Number of parameters": num_params,
+        "Number of FLOPs per token": f"{num_flops_per_token:e}",
+        "Calculated number of iterations": num_iterations,
+        "Number of training tokens": total_tokens,
+        f"Tokens : {target_scaling_params_label} ratio": total_batch_size * num_iterations / target_scaling_params,
+        "DDP world size": ddp_world_size,
+        "warmup_ratio": args.warmup_ratio,
+        "warmdown_ratio": args.warmdown_ratio,
+        "final_lr_frac": args.final_lr_frac,
+    },
+    { # stats about training outcomes
+        "Minimum validation bpb": min_val_bpb if val_bpb is not None else None,
+        "Final validation bpb": val_bpb,
+        "CORE metric estimate": core_results.get("core_metric", None),
+        "CORE metric estimate (no boolq)": core_results.get("core_metric_no_boolq", None),
+        "MFU %": f"{mfu:.2f}%",
+        "Total training flops": f"{flops_so_far:e}",
+        "Total training time": f"{total_training_time/60:.2f}m",
+        "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
+    }
+])
+
+# cleanup
+should_continue_to_chat_sft = args.continue_to_chat_sft and step == num_iterations
+chat_sft_master_port = None
+if should_continue_to_chat_sft:
+    chat_sft_master_port = prepare_chat_sft_rendezvous(ddp, ddp_rank, device)
+wandb_run.finish() # wandb run finish
+compute_cleanup()
+
+if should_continue_to_chat_sft:
+    chat_sft_argv = build_chat_sft_exec_argv(
+        sys.executable,
+        output_dirname,
+        step,
+        args.continue_to_chat_sft_args,
+    )
+    sanitize_chat_sft_rendezvous_env()
+    if chat_sft_master_port is not None:
+        print0(f"Prepared fresh chat_sft rendezvous port: {chat_sft_master_port}")
+    print0(f"Continuing into chat_sft: {shlex.join(chat_sft_argv)}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execvp(chat_sft_argv[0], chat_sft_argv)
