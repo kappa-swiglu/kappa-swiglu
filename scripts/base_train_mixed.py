@@ -1163,6 +1163,7 @@ signal.signal(signal.SIGTERM, handle_sigterm)
 # Training loop
 while True:
     is_last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    is_resume_step = resuming and step == args.resume_from_step
     should_terminate_after_checkpoint = sigterm_requested and not is_last_step
     refresh_compiled_training_model = False
     tokens_seen = total_batch_size * step
@@ -1179,7 +1180,12 @@ while True:
     )
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if (not should_terminate_after_checkpoint) and (not args.mockup_mode) and args.eval_every > 0 and (is_last_step or (step > 0 and step % args.eval_every == 0)):
+    if (
+        (not should_terminate_after_checkpoint)
+        and (not args.mockup_mode)
+        and args.eval_every > 0
+        and (is_last_step or ((not is_resume_step) and step > 0 and step % args.eval_every == 0))
+    ):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
@@ -1312,7 +1318,12 @@ while True:
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
 
-    if (not should_terminate_after_checkpoint) and (not args.mockup_mode) and args.core_metric_every > 0 and (is_last_step or (step > 0 and step % args.core_metric_every == 0)):
+    if (
+        (not should_terminate_after_checkpoint)
+        and (not args.mockup_mode)
+        and args.core_metric_every > 0
+        and (is_last_step or ((not is_resume_step) and step > 0 and step % args.core_metric_every == 0))
+    ):
         model.eval()
         with disable_fp8(orig_model), autocast_ctx:
             # for the final evaluation at the end of training, run on the full set of tasks instead of a subset            
@@ -1372,7 +1383,7 @@ while True:
         (not should_terminate_after_checkpoint)
         and (not args.mockup_mode)
         and args.sample_every > 0
-        and (is_last_step or (step > 0 and step % args.sample_every == 0))
+        and (is_last_step or ((not is_resume_step) and step > 0 and step % args.sample_every == 0))
     )
     if should_sample:
         if ddp:
@@ -1440,7 +1451,7 @@ while True:
             'aux_loss': 0.0,
             'router_z_loss': 0.0,
             'kappa_bias_l2_loss': 0.0,
-            'kappa_bias_shift_abs_mean': 0.0,
+            'kappa_slope_scale_abs_mean': 0.0,
             'drop_rate_per_ks': None,
         }
         train_loss_f = 0.0
@@ -1554,10 +1565,10 @@ while True:
             "train/aux_loss_step":          losses['aux_loss'],
             "train/router_z_loss_step":     losses['router_z_loss'],
             "train/kappa_bias_l2_loss_step": losses['kappa_bias_l2_loss'],
-            "train/kappa_bias_shift_abs_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_mean'].mean()),
-            "train/kappa_bias_shift_abs_top5p_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_top5p_mean'].mean()),
-            "train/kappa_bias_shift_abs_bottom5p_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_bottom5p_mean'].mean()),
-            "train/kappa_bias_shift_abs_mean_normalized_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_mean_normalized'].mean()),
+            "train/kappa_slope_scale_abs_mean_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_mean'].mean()),
+            "train/kappa_slope_scale_abs_top5p_mean_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_top5p_mean'].mean()),
+            "train/kappa_slope_scale_abs_bottom5p_mean_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_bottom5p_mean'].mean()),
+            "train/kappa_slope_scale_abs_mean_normalized_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_mean_normalized'].mean()),
             "train/kappa_bias_lr_scale": kappa_bias_lr_scale,
             "lrm": lrm,
             "dt": dt,
@@ -1596,14 +1607,14 @@ while True:
                 log_data.update({f"inspect/exp_kappa_bias_mean_{i}": losses[f'exp_kappa_bias_mean_{i}']})
             if f'exp_kappa_bias_abs_mean_{i}' in losses:
                 log_data.update({f"inspect/exp_kappa_bias_abs_mean_{i}": losses[f'exp_kappa_bias_abs_mean_{i}']})
-            if f'kappa_bias_shift_abs_mean_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_mean_{i}": losses[f'kappa_bias_shift_abs_mean_{i}']})
-            if f'kappa_bias_shift_abs_top5p_mean_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_top5p_mean_{i}": losses[f'kappa_bias_shift_abs_top5p_mean_{i}']})
-            if f'kappa_bias_shift_abs_bottom5p_mean_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_bottom5p_mean_{i}": losses[f'kappa_bias_shift_abs_bottom5p_mean_{i}']})
-            if f'kappa_bias_shift_abs_mean_normalized_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_mean_normalized_{i}": losses[f'kappa_bias_shift_abs_mean_normalized_{i}']})
+            if f'kappa_slope_scale_abs_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_mean_{i}": losses[f'kappa_slope_scale_abs_mean_{i}']})
+            if f'kappa_slope_scale_abs_top5p_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_top5p_mean_{i}": losses[f'kappa_slope_scale_abs_top5p_mean_{i}']})
+            if f'kappa_slope_scale_abs_bottom5p_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_bottom5p_mean_{i}": losses[f'kappa_slope_scale_abs_bottom5p_mean_{i}']})
+            if f'kappa_slope_scale_abs_mean_normalized_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_mean_normalized_{i}": losses[f'kappa_slope_scale_abs_mean_normalized_{i}']})
             if f'mean_abs_gate_{i}' in losses:
                 log_data.update({f"inspect/mean_abs_gate_{i}": losses[f'mean_abs_gate_{i}']})
             if f'active_frac_gate_{i}' in losses:

@@ -166,6 +166,130 @@ class SoftcapInPlace(torch.autograd.Function):
         return grad_input, None
 
 
+class ChunkedLinearCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def _softcap_logits_(logits, softcap):
+        logits.div_(softcap)
+        logits.tanh_()
+        logits.mul_(softcap)
+        return logits
+
+    @staticmethod
+    def forward(ctx, hidden_flat, targets_flat, weight, vocab_size, softcap, loss_reduction, chunk_tokens):
+        vocab_size = int(vocab_size)
+        softcap = float(softcap)
+        chunk_tokens = int(chunk_tokens)
+        targets_flat = targets_flat.reshape(-1)
+        weight_vocab = weight[:vocab_size]
+        weight_vocab_for_mm = weight_vocab.to(dtype=hidden_flat.dtype)
+        valid_mask = targets_flat.ne(-1)
+        valid_tokens = valid_mask.sum()
+
+        if loss_reduction == 'none':
+            losses = hidden_flat.new_zeros(targets_flat.shape, dtype=torch.float32)
+        else:
+            loss_sum = hidden_flat.new_zeros((), dtype=torch.float32)
+
+        for chunk_start in range(0, hidden_flat.size(0), chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, hidden_flat.size(0))
+            chunk_hidden = hidden_flat[chunk_start:chunk_end]
+            chunk_targets = targets_flat[chunk_start:chunk_end]
+            chunk_valid_mask = chunk_targets.ne(-1)
+            if not bool(chunk_valid_mask.any().item()):
+                continue
+
+            logits = F.linear(chunk_hidden, weight_vocab_for_mm)
+            logits = ChunkedLinearCrossEntropy._softcap_logits_(logits, softcap)
+            logsumexp = torch.logsumexp(logits, dim=-1)
+            safe_targets = chunk_targets.clamp_min(0)
+            target_logits = logits.gather(1, safe_targets.unsqueeze(1)).squeeze(1)
+            chunk_losses = (logsumexp - target_logits).float()
+            chunk_losses = chunk_losses * chunk_valid_mask.to(dtype=chunk_losses.dtype)
+
+            if loss_reduction == 'none':
+                losses[chunk_start:chunk_end] = chunk_losses
+            else:
+                loss_sum = loss_sum + chunk_losses.sum()
+
+        ctx.save_for_backward(hidden_flat, targets_flat, weight, valid_tokens)
+        ctx.vocab_size = vocab_size
+        ctx.softcap = softcap
+        ctx.loss_reduction = loss_reduction
+        ctx.chunk_tokens = chunk_tokens
+
+        if loss_reduction == 'none':
+            return losses
+        if loss_reduction == 'sum':
+            return loss_sum
+        mean_loss = loss_sum / valid_tokens.clamp_min(1).to(dtype=loss_sum.dtype)
+        zero_loss = hidden_flat.sum(dtype=loss_sum.dtype) * 0.0
+        return torch.where(valid_tokens > 0, mean_loss, zero_loss)
+
+    @staticmethod
+    def backward(ctx, grad_output):  # pragma: no cover
+        hidden_flat, targets_flat, weight, valid_tokens = ctx.saved_tensors
+        vocab_size = ctx.vocab_size
+        softcap = ctx.softcap
+        loss_reduction = ctx.loss_reduction
+        chunk_tokens = ctx.chunk_tokens
+        weight_vocab = weight[:vocab_size]
+        weight_vocab_for_mm = weight_vocab.to(dtype=hidden_flat.dtype)
+
+        grad_hidden = torch.zeros_like(hidden_flat) if ctx.needs_input_grad[0] else None
+        grad_weight = torch.zeros_like(weight) if ctx.needs_input_grad[2] else None
+
+        if not bool((valid_tokens > 0).item()):
+            return grad_hidden, None, grad_weight, None, None, None, None
+
+        if loss_reduction == 'mean':
+            base_scale = grad_output / valid_tokens.to(device=grad_output.device, dtype=grad_output.dtype)
+        elif loss_reduction == 'sum':
+            base_scale = grad_output
+        else:
+            base_scale = None
+
+        for chunk_start in range(0, hidden_flat.size(0), chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, hidden_flat.size(0))
+            chunk_hidden = hidden_flat[chunk_start:chunk_end]
+            chunk_targets = targets_flat[chunk_start:chunk_end]
+            chunk_valid_mask = chunk_targets.ne(-1)
+            if not bool(chunk_valid_mask.any().item()):
+                continue
+
+            logits_raw = F.linear(chunk_hidden, weight_vocab_for_mm)
+            logits = ChunkedLinearCrossEntropy._softcap_logits_(logits_raw, softcap)
+            grad_logits = torch.softmax(logits, dim=-1)
+            safe_targets = chunk_targets.clamp_min(0)
+            grad_logits.scatter_add_(
+                1,
+                safe_targets.unsqueeze(1),
+                -chunk_valid_mask.to(dtype=grad_logits.dtype).unsqueeze(1),
+            )
+            grad_logits.mul_(chunk_valid_mask.to(dtype=grad_logits.dtype).unsqueeze(1))
+
+            if loss_reduction == 'none':
+                chunk_scale = grad_output[chunk_start:chunk_end].to(dtype=grad_logits.dtype).unsqueeze(1)
+            else:
+                chunk_scale = base_scale.to(dtype=grad_logits.dtype)
+            grad_logits.mul_(chunk_scale)
+
+            softcap_grad = 1.0 - logits.square().div(softcap * softcap)
+            grad_logits.mul_(softcap_grad)
+
+            if grad_hidden is not None:
+                grad_hidden[chunk_start:chunk_end] = torch.mm(
+                    grad_logits.to(dtype=weight_vocab_for_mm.dtype),
+                    weight_vocab_for_mm,
+                ).to(dtype=grad_hidden.dtype)
+            if grad_weight is not None:
+                grad_weight[:vocab_size].add_(torch.mm(
+                    grad_logits.transpose(0, 1).to(dtype=chunk_hidden.dtype),
+                    chunk_hidden,
+                ).to(dtype=grad_weight.dtype))
+
+        return grad_hidden, None, grad_weight, None, None, None, None
+
+
 def _get_loss_chunk_tokens(config, total_tokens: int) -> int:
     """Bound lm_head/loss work to a token chunk that keeps peak vocab activations manageable."""
     configured = getattr(config, "loss_chunk_tokens", None)
@@ -190,11 +314,26 @@ def _chunked_cross_entropy(
     softcap: float,
     loss_reduction: str,
     chunk_tokens: int,
+    recompute_backward: bool = False,
 ) -> torch.Tensor:
     """Compute next-token loss without materializing full training logits at once."""
     hidden_flat = hidden_states.reshape(-1, hidden_states.size(-1))
     targets_flat = targets.reshape(-1)
     valid_tokens = targets_flat.ne(-1).sum()
+
+    if loss_reduction not in {'mean', 'sum', 'none'}:
+        raise ValueError(f"Unsupported loss_reduction: {loss_reduction}")
+
+    if recompute_backward:
+        return ChunkedLinearCrossEntropy.apply(
+            hidden_flat,
+            targets_flat,
+            lm_head.weight,
+            vocab_size,
+            softcap,
+            loss_reduction,
+            chunk_tokens,
+        )
 
     if chunk_tokens >= hidden_flat.size(0):
         logits = lm_head(hidden_flat)
@@ -221,9 +360,6 @@ def _chunked_cross_entropy(
                 reduction='none',
             ))
         return torch.cat(chunk_losses, dim=0)
-
-    if loss_reduction not in {'mean', 'sum'}:
-        raise ValueError(f"Unsupported loss_reduction: {loss_reduction}")
 
     loss_sum = None
     for chunk_start in range(0, hidden_flat.size(0), chunk_tokens):
@@ -920,7 +1056,7 @@ class Qwen3MLP(nn.Module):
             device=kappa_bias.device,
             dtype=target_dtype,
         )
-        log_kappa = 2 * kappa_bias * input_constant
+        log_kappa = kappa_bias * input_constant
         return torch.exp(torch.log(kappa_slope_max_scale) * torch.tanh(log_kappa))
 
     @torch._dynamo.disable
@@ -928,6 +1064,7 @@ class Qwen3MLP(nn.Module):
         kappa_bias_param = self._get_kappa_bias_parameter() if self.has_active_kappa_bias else None
         bias_version = None if kappa_bias_param is None else kappa_bias_param._version
         scale_version = self.kappa_slope_max_scale._version
+        # If kappa_slope_scales is cached, then return the cache.
         if (
             self._eval_kappa_slope_scales_cache is not None
             and self._eval_kappa_slope_scales_cache_dtype == target_dtype
@@ -936,6 +1073,8 @@ class Qwen3MLP(nn.Module):
             and self._eval_kappa_slope_scales_cache_scale_version == scale_version
         ):
             return self._eval_kappa_slope_scales_cache
+        # If kappa_slope_scales is not cached, 
+        # compute in the same way as training.
         kappa_bias = self._materialize_kappa_bias().to(device=target_device, dtype=target_dtype)
         slope_scales = self._compute_kappa_slope_scales(kappa_bias)
         self._eval_kappa_slope_scales_cache = slope_scales
@@ -1007,9 +1146,9 @@ class Qwen3MLP(nn.Module):
         flat_slope_scales = slope_scales.reshape(1, -1)
         flat_mask = torch.ones_like(flat_slope_scales, dtype=torch.bool)
         slope_scale_mean = slope_scales.mean()
-        MANAGER.add("kappa_bias_shift_abs_mean", slope_scale_mean)
+        MANAGER.add("kappa_slope_scale_abs_mean", slope_scale_mean)
         MANAGER.add(
-            "kappa_bias_shift_abs_top5p_mean",
+            "kappa_slope_scale_abs_top5p_mean",
             _mean_extreme_percentile_per_row(
                 flat_slope_scales,
                 flat_mask,
@@ -1018,7 +1157,7 @@ class Qwen3MLP(nn.Module):
             ).squeeze(0),
         )
         MANAGER.add(
-            "kappa_bias_shift_abs_bottom5p_mean",
+            "kappa_slope_scale_abs_bottom5p_mean",
             _mean_extreme_percentile_per_row(
                 flat_slope_scales,
                 flat_mask,
@@ -1026,7 +1165,7 @@ class Qwen3MLP(nn.Module):
                 largest=False,
             ).squeeze(0),
         )
-        MANAGER.add("kappa_bias_shift_abs_mean_normalized", slope_scale_mean)
+        MANAGER.add("kappa_slope_scale_abs_mean_normalized", slope_scale_mean)
 
     def forward(self, x):
         gate_out_raw = self.gate_proj(x)
@@ -1365,7 +1504,7 @@ class Qwen3MLPExperts(nn.Module):
             slope_work = torch.addcmul(kappa_bias, slope_work, kappa_scale)
         else:
             slope_work = slope_work * kappa_bias
-        slope_work = torch.exp(torch.log(kappa_slope_max_scale) * torch.tanh(2.0 * slope_work))
+        slope_work = torch.exp(torch.log(kappa_slope_max_scale) * torch.tanh(slope_work))
         self._update_kappa_slope_scale_stats(slope_work, selected_router_scores)
         slope_work = slope_work.to(dtype=gate_out_raw.dtype)
         return gate_out_raw * torch.sigmoid(gate_out_raw * slope_work)
@@ -1387,7 +1526,6 @@ class Qwen3MLPExperts(nn.Module):
             slope_work = torch.addcmul(kappa_bias, slope_work, kappa_scale)
         else:
             slope_work = slope_work * kappa_bias
-        slope_work.mul_(2.0)
         slope_work.tanh_()
         slope_work.mul_(log_kappa_slope_max_scale)
         slope_work.exp_()
@@ -1525,12 +1663,12 @@ class Qwen3MLPExperts(nn.Module):
         slope_scale_mean = (
             slope_scale_mean_per_expert * active_token_counts
         ).sum() / total_active_tokens.clamp_min(1)
-        MANAGER.add("kappa_bias_shift_abs_mean", slope_scale_mean.detach())
+        MANAGER.add("kappa_slope_scale_abs_mean", slope_scale_mean.detach())
         # slope_scales: [n_exp, capacity, intermediate_size]
         slope_scales_flat = slope_scales.reshape(slope_scales.size(0), -1)
         active_slope_mask_flat = active_mask.unsqueeze(-1).expand_as(slope_scales).reshape(slope_scales.size(0), -1)
         MANAGER.add(
-            "kappa_bias_shift_abs_top5p_mean",
+            "kappa_slope_scale_abs_top5p_mean",
             _mean_extreme_percentile_per_row(
                 slope_scales_flat,
                 active_slope_mask_flat,
@@ -1539,7 +1677,7 @@ class Qwen3MLPExperts(nn.Module):
             ).detach(),
         )
         MANAGER.add(
-            "kappa_bias_shift_abs_bottom5p_mean",
+            "kappa_slope_scale_abs_bottom5p_mean",
             _mean_extreme_percentile_per_row(
                 slope_scales_flat,
                 active_slope_mask_flat,
@@ -1552,7 +1690,7 @@ class Qwen3MLPExperts(nn.Module):
         normalized_slope_scale_mean = (
             slope_scale_mean_per_expert * active_token_counts_sqrt
         ).sum() / total_active_tokens_sqrt
-        MANAGER.add("kappa_bias_shift_abs_mean_normalized", normalized_slope_scale_mean.detach())
+        MANAGER.add("kappa_slope_scale_abs_mean_normalized", normalized_slope_scale_mean.detach())
 
     @torch._dynamo.disable
     def _update_implicit_gate_proj_bias_stats(self, x, router_weight, selected_router_scores):
@@ -1669,6 +1807,10 @@ class MOELayer(nn.Module):
         self.use_aux_loss = config.use_aux_loss
         self.kappa_input = getattr(config, 'kappa_input', 'router_probs')
         self.kappa_input_constant = getattr(config, 'kappa_input_constant', None)
+        self.kappa_input_logit_norm_exponent = float(
+            getattr(config, 'kappa_input_logit_norm_exponent', 0.0)
+        )
+        self.top_logit_norm_eps = float(getattr(config, 'top_logit_norm_eps', 1e-4))
         self._expert_inputs_cache = None
         self._expert_inputs_cache_dtype = None
         self._expert_inputs_cache_device = None
@@ -1711,6 +1853,11 @@ class MOELayer(nn.Module):
             self._expert_router_scores_cache_dtype = target_dtype
             self._expert_router_scores_cache_device = target_device
             self._expert_router_scores_cache_capacity = exp_capacity
+        else:
+            # The cache becomes graph-connected after the indexed writes below.
+            # Reuse must start from a detached tensor so the next micro-step does
+            # not try to continue the previous autograd graph through this buffer.
+            self._expert_router_scores_cache = self._expert_router_scores_cache.detach()
         self._expert_router_scores_cache.zero_()
         return self._expert_router_scores_cache
 
@@ -1734,6 +1881,11 @@ class MOELayer(nn.Module):
             self._expert_inputs_cache_dtype = target_dtype
             self._expert_inputs_cache_device = target_device
             self._expert_inputs_cache_capacity = exp_capacity
+        else:
+            # See _get_expert_router_scores_buffer: the cached dispatch tensor can
+            # retain autograd history from the previous forward unless we detach it
+            # before overwriting it for the next micro-step.
+            self._expert_inputs_cache = self._expert_inputs_cache.detach()
         self._expert_inputs_cache.zero_()
         return self._expert_inputs_cache
 
@@ -1751,13 +1903,58 @@ class MOELayer(nn.Module):
         self._maybe_collect_load_balancing_stats(rank, valid_expert_indices, exp_capacity)
         return output_flat
 
-    def _select_gate_confidence(self, top_k_scores, router_probs):
+    def _select_gate_confidence(self, top_k_scores, router_probs, x_flat=None, top_k_indices=None):
         if self.kappa_input == 'top_logits':
-            # top_logits are usually 3~4. * 0.15 -> 0.45~0.6. 
-            # Similar as the default "constant" setting of 0.5.
-            return top_k_scores * 0.15
+            if self.kappa_input_logit_norm_exponent <= 0.0:
+                # No normalization.
+                # top_logits are usually 3~4. * 0.3 -> 0.9~1.2. 
+                # Similar as the default "constant" setting of 1.
+                return 0.3 * top_k_scores
+            if top_k_indices is None:
+                raise RuntimeError(
+                    "top_k_indices are required when kappa_input_logit_norm_exponent is enabled"
+                )
+            # For exp32-d10, router_weight_magnitudes_all has (min, max, std)
+            # of (0.24, 0.83, 0.21).
+            router_weight_magnitudes_all = torch.linalg.vector_norm(
+                self.router.w_g.weight,
+                ord=2,
+                dim=-1,
+                dtype=torch.float32,
+            )
+            smoothed_router_weight_magnitudes_all = torch.sqrt(
+                router_weight_magnitudes_all.square() + self.top_logit_norm_eps
+            )
+            # Partial normalization using smoothed_router_weight_magnitudes below
+            # leaves a residual ||w||^(1-alpha) factor.
+            # Calibrate it back to unit scale using the detached layer-wide
+            # average router-weight magnitude, so the correction is batch
+            # independent while keeping relative per-expert magnitude effects.
+            scale_compensation = smoothed_router_weight_magnitudes_all.pow(
+                1.0 - self.kappa_input_logit_norm_exponent
+            ).mean().detach()
+            router_weight_magnitudes = router_weight_magnitudes_all[top_k_indices]
+            # Witout the top_logit_norm_eps term, if router_weight_magnitudes is
+            # close to zero, and kappa_input_logit_norm_exponent = 0.5, then
+            # the grad w.r.t. router_weight_magnitudes will be huge.
+            smoothed_router_weight_magnitudes = torch.sqrt(
+                router_weight_magnitudes.square() + self.top_logit_norm_eps
+            )
+            # Router inputs are RMS-normalized, so each token has L2 norm sqrt(hidden_dim).
+            # sqrt(1024) = 32.
+            token_magnitude = math.sqrt(self.router.w_g.weight.size(-1))
+            normalizer = token_magnitude * smoothed_router_weight_magnitudes.pow(
+                self.kappa_input_logit_norm_exponent
+            ).detach() * scale_compensation
+
+            # Empirically, the average cosine(token embeddings, router weights) is 0.15.
+            # top_k_scores / normalizer is roughly the cosine similarity, i.e., ~ 0.15.
+            # We should multiply it by 6 to get it to be close to 1.0.
+            return 6 * top_k_scores / normalizer.to(dtype=top_k_scores.dtype)
+        
         if self.kappa_input == 'router_probs':
-            return router_probs
+            # When top_k = 2, router_probs are typically 0.5. * 2 -> 1.0.
+            return router_probs * 2
         if self.kappa_input == 'constant':
             if self.kappa_input_constant is None:
                 raise RuntimeError(
@@ -1797,7 +1994,12 @@ class MOELayer(nn.Module):
             x_flat.device,
             x_flat.size(1),
         )
-        selected_gate_confidence = self._select_gate_confidence(top_k_scores, router_probs)
+        selected_gate_confidence = self._select_gate_confidence(
+            top_k_scores,
+            router_probs,
+            x_flat=x_flat,
+            top_k_indices=top_k_indices,
+        )
         expert_router_scores = None
         if self.use_qwen3_moe_mlp:
             expert_router_scores = self._get_expert_router_scores_buffer(
@@ -2308,7 +2510,12 @@ class GPT(nn.Module):
             target_nonmatrix_params = moe_nonmatrix_params if isinstance(mlp, MOELayer) else dense_nonmatrix_params
             for name, param in block.named_parameters():
                 full_name = f'transformer.h.{block_idx}.{name}'
-                if name.startswith('mlp.experts.kappa_bias') or name.startswith('mlp.kappa_bias'):
+                if (
+                    name.startswith('mlp.experts.kappa_bias')
+                    or name.startswith('mlp.kappa_bias')
+                    or name.startswith('mlp.experts.kappa_scale')
+                    or name.startswith('mlp.kappa_scale')
+                ):
                     append_param(kappa_bias_params, param, full_name)
                 elif not use_matrix_optimizer(param):
                     append_param(target_nonmatrix_params, param, full_name)
@@ -2460,10 +2667,10 @@ class GPT(nn.Module):
                    'kappa_bias_ema_rms_reg_loss': 0,
                    'kappa_scale_ema_rms_reg_loss': 0,
                    'gate_grad_scale_mean': None,
-                   'kappa_bias_shift_abs_top5p_mean': 0,
-                   'kappa_bias_shift_abs_bottom5p_mean': 0,
-                   'kappa_bias_shift_abs_mean': 0,
-                   'kappa_bias_shift_abs_mean_normalized': 0,
+                   'kappa_slope_scale_abs_top5p_mean': 0,
+                   'kappa_slope_scale_abs_bottom5p_mean': 0,
+                   'kappa_slope_scale_abs_mean': 0,
+                   'kappa_slope_scale_abs_mean_normalized': 0,
                    'implicit_gate_proj_bias_top5p_mean': 0,
                    'implicit_gate_proj_bias_bottom5p_mean': 0,
                    'routed_token_router_weight_cosine_mean': 0,
@@ -2492,34 +2699,34 @@ class GPT(nn.Module):
             else None
         )
         MANAGER.reset("gate_grad_scale_mean")
-        kappa_bias_shift_abs_top5p_mean = MANAGER.aggregate("kappa_bias_shift_abs_top5p_mean")
-        losses['kappa_bias_shift_abs_top5p_mean'] = (
-            kappa_bias_shift_abs_top5p_mean.detach()
-            if kappa_bias_shift_abs_top5p_mean is not None
+        kappa_slope_scale_abs_top5p_mean = MANAGER.aggregate("kappa_slope_scale_abs_top5p_mean")
+        losses['kappa_slope_scale_abs_top5p_mean'] = (
+            kappa_slope_scale_abs_top5p_mean.detach()
+            if kappa_slope_scale_abs_top5p_mean is not None
             else torch.zeros((), device=x.device)
         )
-        MANAGER.reset("kappa_bias_shift_abs_top5p_mean")
-        kappa_bias_shift_abs_bottom5p_mean = MANAGER.aggregate("kappa_bias_shift_abs_bottom5p_mean")
-        losses['kappa_bias_shift_abs_bottom5p_mean'] = (
-            kappa_bias_shift_abs_bottom5p_mean.detach()
-            if kappa_bias_shift_abs_bottom5p_mean is not None
+        MANAGER.reset("kappa_slope_scale_abs_top5p_mean")
+        kappa_slope_scale_abs_bottom5p_mean = MANAGER.aggregate("kappa_slope_scale_abs_bottom5p_mean")
+        losses['kappa_slope_scale_abs_bottom5p_mean'] = (
+            kappa_slope_scale_abs_bottom5p_mean.detach()
+            if kappa_slope_scale_abs_bottom5p_mean is not None
             else torch.zeros((), device=x.device)
         )
-        MANAGER.reset("kappa_bias_shift_abs_bottom5p_mean")
-        kappa_bias_shift_abs_mean = MANAGER.aggregate("kappa_bias_shift_abs_mean")
-        losses['kappa_bias_shift_abs_mean'] = (
-            kappa_bias_shift_abs_mean.detach()
-            if kappa_bias_shift_abs_mean is not None
+        MANAGER.reset("kappa_slope_scale_abs_bottom5p_mean")
+        kappa_slope_scale_abs_mean = MANAGER.aggregate("kappa_slope_scale_abs_mean")
+        losses['kappa_slope_scale_abs_mean'] = (
+            kappa_slope_scale_abs_mean.detach()
+            if kappa_slope_scale_abs_mean is not None
             else torch.zeros((), device=x.device)
         )
-        MANAGER.reset("kappa_bias_shift_abs_mean")
-        kappa_bias_shift_abs_mean_normalized = MANAGER.aggregate("kappa_bias_shift_abs_mean_normalized")
-        losses['kappa_bias_shift_abs_mean_normalized'] = (
-            kappa_bias_shift_abs_mean_normalized.detach()
-            if kappa_bias_shift_abs_mean_normalized is not None
+        MANAGER.reset("kappa_slope_scale_abs_mean")
+        kappa_slope_scale_abs_mean_normalized = MANAGER.aggregate("kappa_slope_scale_abs_mean_normalized")
+        losses['kappa_slope_scale_abs_mean_normalized'] = (
+            kappa_slope_scale_abs_mean_normalized.detach()
+            if kappa_slope_scale_abs_mean_normalized is not None
             else torch.zeros((), device=x.device)
         )
-        MANAGER.reset("kappa_bias_shift_abs_mean_normalized")
+        MANAGER.reset("kappa_slope_scale_abs_mean_normalized")
         implicit_gate_proj_bias_top5p_mean = MANAGER.aggregate("implicit_gate_proj_bias_top5p_mean")
         losses['implicit_gate_proj_bias_top5p_mean'] = (
             implicit_gate_proj_bias_top5p_mean.detach()
@@ -2572,26 +2779,26 @@ class GPT(nn.Module):
         implicit_gate_proj_bias_layer_to_stats_idx = {
             layer_idx: stats_idx for stats_idx, layer_idx in enumerate(implicit_gate_proj_bias_layer_indices)
         }
-        kappa_bias_shift_abs_top5p_mean = losses['kappa_bias_shift_abs_top5p_mean']
-        kappa_bias_shift_abs_bottom5p_mean = losses['kappa_bias_shift_abs_bottom5p_mean']
-        kappa_bias_shift_abs_top5p_count = (
-            kappa_bias_shift_abs_top5p_mean.shape[0]
-            if kappa_bias_shift_abs_top5p_mean.ndim > 0
+        kappa_slope_scale_abs_top5p_mean = losses['kappa_slope_scale_abs_top5p_mean']
+        kappa_slope_scale_abs_bottom5p_mean = losses['kappa_slope_scale_abs_bottom5p_mean']
+        kappa_slope_scale_abs_top5p_count = (
+            kappa_slope_scale_abs_top5p_mean.shape[0]
+            if kappa_slope_scale_abs_top5p_mean.ndim > 0
             else 0
         )
-        kappa_bias_shift_abs_bottom5p_count = (
-            kappa_bias_shift_abs_bottom5p_mean.shape[0]
-            if kappa_bias_shift_abs_bottom5p_mean.ndim > 0
+        kappa_slope_scale_abs_bottom5p_count = (
+            kappa_slope_scale_abs_bottom5p_mean.shape[0]
+            if kappa_slope_scale_abs_bottom5p_mean.ndim > 0
             else 0
         )
-        kappa_bias_shift_abs_mean_count = (
-            kappa_bias_shift_abs_mean.shape[0]
-            if kappa_bias_shift_abs_mean is not None and kappa_bias_shift_abs_mean.ndim > 0
+        kappa_slope_scale_abs_mean_count = (
+            kappa_slope_scale_abs_mean.shape[0]
+            if kappa_slope_scale_abs_mean is not None and kappa_slope_scale_abs_mean.ndim > 0
             else 0
         )
-        kappa_bias_shift_abs_mean_normalized_count = (
-            kappa_bias_shift_abs_mean_normalized.shape[0]
-            if kappa_bias_shift_abs_mean_normalized is not None and kappa_bias_shift_abs_mean_normalized.ndim > 0
+        kappa_slope_scale_abs_mean_normalized_count = (
+            kappa_slope_scale_abs_mean_normalized.shape[0]
+            if kappa_slope_scale_abs_mean_normalized is not None and kappa_slope_scale_abs_mean_normalized.ndim > 0
             else 0
         )
         implicit_gate_proj_bias_top5p_count = (
@@ -2620,21 +2827,21 @@ class GPT(nn.Module):
             else 0
         )
         for layer_idx, kappa_bias_stats_idx in kappa_bias_layer_to_stats_idx.items():
-            if kappa_bias_stats_idx < kappa_bias_shift_abs_mean_count:
-                losses[f'kappa_bias_shift_abs_mean_{layer_idx}'] = (
-                    kappa_bias_shift_abs_mean[kappa_bias_stats_idx].item()
+            if kappa_bias_stats_idx < kappa_slope_scale_abs_mean_count:
+                losses[f'kappa_slope_scale_abs_mean_{layer_idx}'] = (
+                    kappa_slope_scale_abs_mean[kappa_bias_stats_idx].item()
                 )
-            if kappa_bias_stats_idx < kappa_bias_shift_abs_mean_normalized_count:
-                losses[f'kappa_bias_shift_abs_mean_normalized_{layer_idx}'] = (
-                    kappa_bias_shift_abs_mean_normalized[kappa_bias_stats_idx].item()
+            if kappa_bias_stats_idx < kappa_slope_scale_abs_mean_normalized_count:
+                losses[f'kappa_slope_scale_abs_mean_normalized_{layer_idx}'] = (
+                    kappa_slope_scale_abs_mean_normalized[kappa_bias_stats_idx].item()
                 )
-            if kappa_bias_stats_idx < kappa_bias_shift_abs_top5p_count:
-                losses[f'kappa_bias_shift_abs_top5p_mean_{layer_idx}'] = (
-                    kappa_bias_shift_abs_top5p_mean[kappa_bias_stats_idx].item()
+            if kappa_bias_stats_idx < kappa_slope_scale_abs_top5p_count:
+                losses[f'kappa_slope_scale_abs_top5p_mean_{layer_idx}'] = (
+                    kappa_slope_scale_abs_top5p_mean[kappa_bias_stats_idx].item()
                 )
-            if kappa_bias_stats_idx < kappa_bias_shift_abs_bottom5p_count:
-                losses[f'kappa_bias_shift_abs_bottom5p_mean_{layer_idx}'] = (
-                    kappa_bias_shift_abs_bottom5p_mean[kappa_bias_stats_idx].item()
+            if kappa_bias_stats_idx < kappa_slope_scale_abs_bottom5p_count:
+                losses[f'kappa_slope_scale_abs_bottom5p_mean_{layer_idx}'] = (
+                    kappa_slope_scale_abs_bottom5p_mean[kappa_bias_stats_idx].item()
                 )
         for layer_idx, implicit_stats_idx in implicit_gate_proj_bias_layer_to_stats_idx.items():
             if implicit_stats_idx < implicit_gate_proj_bias_top5p_count:
@@ -2675,6 +2882,7 @@ class GPT(nn.Module):
                 softcap,
                 loss_reduction,
                 _get_loss_chunk_tokens(self.config, x.size(0) * x.size(1)),
+                recompute_backward=bool(getattr(self.config, 'loss_recompute_backward', False)),
             )
             losses['ntp_loss'] = loss.detach()
 

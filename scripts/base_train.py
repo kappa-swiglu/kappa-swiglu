@@ -222,8 +222,12 @@ parser.add_argument("--use-kappa-swiglu", type=str2bool, nargs='?', const=True, 
                     help="add a learnable bias to Qwen3 expert gate activations after gate_proj and SiLU")
 parser.add_argument("--kappa-input", dest="kappa_input", type=str, default="top_logits", choices=["top_logits", "router_probs", "constant"],
                     help="router confidence signal used by kappa_bias: raw selected logits, top-k router probabilities, or a constant value")
-parser.add_argument("--kappa-input-constant", dest="kappa_input_constant", type=float, default=0.5,
+parser.add_argument("--kappa-input-constant", dest="kappa_input_constant", type=float, default=1.0,
                     help="constant confidence value to use when --kappa-input=constant")
+parser.add_argument("--kappa-input-logit-norm-exponent", dest="kappa_input_logit_norm_exponent", type=float, default=0.5,
+                    help="when --kappa-input=top_logits, divide selected router logits by selected router-weight magnitudes raised to this exponent (0 = disabled, 1 = full router-weight normalization)")
+parser.add_argument("--loss-recompute-backward", dest="loss_recompute_backward", type=str2bool, nargs='?', const=True, default=False,
+                    help="recompute lm_head loss chunks during backward to reduce retained vocab-logit memory at the cost of speed")
 parser.add_argument("--moe-kappa-slope-max-scale", type=float, default=3.0,
                     help="maximum slope scale used by MoE kappa_bias modulation")
 parser.add_argument("--dense-kappa-slope-max-scale", type=float, default=2.0,
@@ -264,7 +268,7 @@ parser.add_argument("--kappa-l2-ema-anchor-end", dest="kappa_l2_ema_anchor_end",
                     help="fraction of total iterations where the anchored EMA RMS floor regularizer stops updating its target")
 parser.add_argument("--kappa-l2-ema-floor-frac", dest="kappa_l2_ema_floor_frac", type=float, default=0.9,
                     help="floor fraction applied to the anchored EMA RMS target when --kappa-ema-rms-reg is enabled")
-parser.add_argument("--kappa-scale-l2-loss-weight-scale", type=float, default=2.0,
+parser.add_argument("--kappa-scale-l2-loss-weight-scale", type=float, default=0.5,
                     help="multiplier applied to --kappa-l2-loss-weight when weighting kappa_scale L2 loss")
 parser.add_argument("--kappa-l2-loss-anneal-iterations", dest="kappa_l2_loss_anneal_iterations", type=int, default=-1, help="iterations for stage-1 anneal of the MoE (2D) kappa_bias L2 loss from 1.0 to --kappa-l2-loss-stage1-frac (-1 = use half total training iterations)")
 # By default, the stage1 frac and final frac are set to 1 to 
@@ -389,6 +393,8 @@ if args.kappa_l2_ema_anchor_end > 1.0:
     raise ValueError("--kappa-l2-ema-anchor-end must satisfy 0 <= end <= 1")
 if args.kappa_l2_ema_floor_frac < 0.0:
     raise ValueError("--kappa-l2-ema-floor-frac must be >= 0")
+if args.kappa_input_logit_norm_exponent is not None and args.kappa_input_logit_norm_exponent < 0.0:
+    raise ValueError("--kappa-input-logit-norm-exponent must be >= 0")
 
 '''
 # Aurora and kappa-bias interact more stably when the confidence input is
@@ -565,6 +571,7 @@ def build_model_meta(depth):
         use_kappa_swiglu=args.use_kappa_swiglu,
         kappa_input=args.kappa_input,
         kappa_input_constant=args.kappa_input_constant,
+        kappa_input_logit_norm_exponent=args.kappa_input_logit_norm_exponent,
         moe_kappa_slope_max_scale=args.moe_kappa_slope_max_scale,
         dense_kappa_slope_max_scale=args.dense_kappa_slope_max_scale,
         constant_kappa_bias_dense_layers=args.constant_kappa_dense_layers,
@@ -584,6 +591,7 @@ def build_model_meta(depth):
         n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         loss_chunk_tokens=resolved_loss_chunk_tokens,
+        loss_recompute_backward=args.loss_recompute_backward,
         debug=args.debug
     )
     with torch.device("meta"):
@@ -1376,6 +1384,7 @@ if hasattr(signal, "SIGHUP"):
 # Training loop
 while True:
     is_last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    is_resume_step = resuming and step == args.resume_from_step
     should_terminate_after_checkpoint = shutdown_requested and not is_last_step
     refresh_compiled_training_model = False
     run_eager_training_step_after_core_eval = False
@@ -1423,7 +1432,12 @@ while True:
     )
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if (not should_terminate_after_checkpoint) and (not args.mockup_mode) and args.eval_every > 0 and (is_last_step or (step > 0 and step % args.eval_every == 0)):
+    if (
+        (not should_terminate_after_checkpoint)
+        and (not args.mockup_mode)
+        and args.eval_every > 0
+        and (is_last_step or ((not is_resume_step) and step > 0 and step % args.eval_every == 0))
+    ):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
@@ -1557,7 +1571,12 @@ while True:
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
 
-    if (not should_terminate_after_checkpoint) and (not args.mockup_mode) and args.core_metric_every > 0 and (is_last_step or (step > 0 and step % args.core_metric_every == 0)):
+    if (
+        (not should_terminate_after_checkpoint)
+        and (not args.mockup_mode)
+        and args.core_metric_every > 0
+        and (is_last_step or ((not is_resume_step) and step > 0 and step % args.core_metric_every == 0))
+    ):
         model.eval()
         with disable_fp8(orig_model), autocast_ctx:
             # for the final evaluation at the end of training, run on the full set of tasks instead of a subset            
@@ -1620,7 +1639,7 @@ while True:
         (not should_terminate_after_checkpoint)
         and (not args.mockup_mode)
         and args.sample_every > 0
-        and (is_last_step or (step > 0 and step % args.sample_every == 0))
+        and (is_last_step or ((not is_resume_step) and step > 0 and step % args.sample_every == 0))
     )
     if should_sample:
         if ddp:
@@ -1701,7 +1720,7 @@ while True:
             'kappa_scale_l2_loss': 0.0,
             'kappa_bias_ema_rms_reg_loss': 0.0,
             'kappa_scale_ema_rms_reg_loss': 0.0,
-            'kappa_bias_shift_abs_mean': 0.0,
+            'kappa_slope_scale_abs_mean': 0.0,
             'drop_rate_per_ks': None,
         }
         train_loss_f = 0.0
@@ -1871,10 +1890,10 @@ while True:
             "train/kappa_scale_l2_loss_step": losses['kappa_scale_l2_loss'],
             "train/kappa_bias_ema_rms_reg_loss_step": losses['kappa_bias_ema_rms_reg_loss'],
             "train/kappa_scale_ema_rms_reg_loss_step": losses['kappa_scale_ema_rms_reg_loss'],
-            "train/kappa_bias_shift_abs_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_mean'].mean()),
-            "train/kappa_bias_shift_abs_top5p_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_top5p_mean'].mean()),
-            "train/kappa_bias_shift_abs_bottom5p_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_bottom5p_mean'].mean()),
-            "train/kappa_bias_shift_abs_mean_normalized_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_mean_normalized'].mean()),
+            "train/kappa_slope_scale_abs_mean_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_mean'].mean()),
+            "train/kappa_slope_scale_abs_top5p_mean_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_top5p_mean'].mean()),
+            "train/kappa_slope_scale_abs_bottom5p_mean_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_bottom5p_mean'].mean()),
+            "train/kappa_slope_scale_abs_mean_normalized_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_mean_normalized'].mean()),
             "train/implicit_gate_proj_bias_top5p_mean_step": scalar_loss_to_item(losses['implicit_gate_proj_bias_top5p_mean'].mean()),
             "train/implicit_gate_proj_bias_bottom5p_mean_step": scalar_loss_to_item(losses['implicit_gate_proj_bias_bottom5p_mean'].mean()),
             "train/routed_token_router_weight_cosine_mean_step": scalar_loss_to_item(losses['routed_token_router_weight_cosine_mean'].mean()),
@@ -1956,14 +1975,14 @@ while True:
                 log_data.update({f"inspect/kappa_scale_negative_mean_top_{i}": losses[f'kappa_scale_negative_mean_top_{i}']})
             if f'kappa_scale_negative_mean_bottom_{i}' in losses:
                 log_data.update({f"inspect/kappa_scale_negative_mean_bottom_{i}": losses[f'kappa_scale_negative_mean_bottom_{i}']})
-            if f'kappa_bias_shift_abs_mean_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_mean_{i}": losses[f'kappa_bias_shift_abs_mean_{i}']})
-            if f'kappa_bias_shift_abs_top5p_mean_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_top5p_mean_{i}": losses[f'kappa_bias_shift_abs_top5p_mean_{i}']})
-            if f'kappa_bias_shift_abs_bottom5p_mean_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_bottom5p_mean_{i}": losses[f'kappa_bias_shift_abs_bottom5p_mean_{i}']})
-            if f'kappa_bias_shift_abs_mean_normalized_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_mean_normalized_{i}": losses[f'kappa_bias_shift_abs_mean_normalized_{i}']})
+            if f'kappa_slope_scale_abs_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_mean_{i}": losses[f'kappa_slope_scale_abs_mean_{i}']})
+            if f'kappa_slope_scale_abs_top5p_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_top5p_mean_{i}": losses[f'kappa_slope_scale_abs_top5p_mean_{i}']})
+            if f'kappa_slope_scale_abs_bottom5p_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_bottom5p_mean_{i}": losses[f'kappa_slope_scale_abs_bottom5p_mean_{i}']})
+            if f'kappa_slope_scale_abs_mean_normalized_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_mean_normalized_{i}": losses[f'kappa_slope_scale_abs_mean_normalized_{i}']})
             if f'implicit_gate_proj_bias_top5p_mean_{i}' in losses:
                 log_data.update({f"inspect/implicit_gate_proj_bias_top5p_mean_{i}": losses[f'implicit_gate_proj_bias_top5p_mean_{i}']})
             if f'implicit_gate_proj_bias_bottom5p_mean_{i}' in losses:
@@ -2018,14 +2037,14 @@ while True:
                 log_data.update({f"inspect/kappa_bias_mean_{i}": losses[f'kappa_bias_mean_{i}']})
             if f'kappa_bias_abs_mean_{i}' in losses:
                 log_data.update({f"inspect/kappa_bias_abs_mean_{i}": losses[f'kappa_bias_abs_mean_{i}']})
-            if f'kappa_bias_shift_abs_mean_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_mean_{i}": losses[f'kappa_bias_shift_abs_mean_{i}']})
-            if f'kappa_bias_shift_abs_top5p_mean_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_top5p_mean_{i}": losses[f'kappa_bias_shift_abs_top5p_mean_{i}']})
-            if f'kappa_bias_shift_abs_bottom5p_mean_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_bottom5p_mean_{i}": losses[f'kappa_bias_shift_abs_bottom5p_mean_{i}']})
-            if f'kappa_bias_shift_abs_mean_normalized_{i}' in losses:
-                log_data.update({f"inspect/kappa_bias_shift_abs_mean_normalized_{i}": losses[f'kappa_bias_shift_abs_mean_normalized_{i}']})
+            if f'kappa_slope_scale_abs_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_mean_{i}": losses[f'kappa_slope_scale_abs_mean_{i}']})
+            if f'kappa_slope_scale_abs_top5p_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_top5p_mean_{i}": losses[f'kappa_slope_scale_abs_top5p_mean_{i}']})
+            if f'kappa_slope_scale_abs_bottom5p_mean_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_bottom5p_mean_{i}": losses[f'kappa_slope_scale_abs_bottom5p_mean_{i}']})
+            if f'kappa_slope_scale_abs_mean_normalized_{i}' in losses:
+                log_data.update({f"inspect/kappa_slope_scale_abs_mean_normalized_{i}": losses[f'kappa_slope_scale_abs_mean_normalized_{i}']})
                         
         wandb_run.log(drop_none_log_values(log_data), step=step)
 

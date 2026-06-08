@@ -40,6 +40,7 @@ from tasks.common import TaskMixture
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
+from tasks.tulu3 import Tulu3SFTMixture
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
@@ -70,7 +71,9 @@ parser.add_argument("--model-save-tag", type=str, default=None, help="extra mode
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
-parser.add_argument("--train-mixture-repeats", type=int, default=4, help="expand the train mixture by N repeats; procedural tasks use fresh index ranges and SmolTalk grows its slice accordingly (default: 1)")
+parser.add_argument("--train-mixture-repeats", type=int, default=4, help="expand the train mixture by N repeats; "
+                    "tulu3 is not repeated; procedural tasks use fresh index ranges and SmolTalk grows its slice accordingly (default: 4)")
+parser.add_argument("--use-tulu3-sft-mixture", type=str2bool, nargs='?', const=True, default=False, help="include allenai/tulu-3-sft-mixture in the SFT train mixture")
 # Batch sizes
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--device-batch-size", type=int, default=16, help="per-device batch size")
@@ -97,7 +100,9 @@ parser.add_argument(
     default=1e-2,
     help="L2 weight on kappa_bias values",
 )
-parser.add_argument("--exp-kappa-bias-l2-anchor", type=str, choices=("initial", "zero"), default="zero",
+parser.add_argument("--kappa-scale-l2-loss-weight-scale", type=float, default=0.5,
+                    help="multiplier applied to --kappa-l2-loss-weight when weighting kappa_scale L2 loss")
+parser.add_argument("--kappa-bias-l2-anchor", type=str, choices=("initial", "zero"), default="zero",
                     help="anchor expert kappa bias L2 either around the loaded initial value or around 0")
 parser.add_argument("--muon-match-rms-adamw", type=str2bool, nargs='?', const=True, default=True, help="use Kimi Muon LR scaling: 0.2*sqrt(max(out,in))")
 parser.add_argument("--weight-decay", type=float, default=0.005, help="cautious weight decay for the Muon optimizer (for weights)")
@@ -114,6 +119,7 @@ parser.add_argument("--chat-eval-num-samples", type=int, default=1, help="number
 parser.add_argument("--chat-eval-top-k", type=int, default=50, help="top-k for generative chat eval")
 parser.add_argument("--chat-eval-batch-size", type=int, default=8, help="batch size for categorical chat eval")
 parser.add_argument("--chat-eval-max-problems", type=int, default=None, help="max problems per chat eval task")
+parser.add_argument("--eval-only", action="store_true", help="load the checkpoint, run evaluation, and exit without training")
 # Output
 parser.add_argument("--dry-run", action="store_true", help="log to wandb but skip checkpoints/report")
 parser.add_argument("--wandb-api-key-file", type=str, default=None, help="Weights & Biases API key file (optional). If provided, sets WANDB_API_KEY for this run")
@@ -130,6 +136,7 @@ if args.kappa_bias_lr_warmup_iterations < 0:
 user_config = vars(args).copy()
 matrix_optimizer_was_specified = arg_was_explicitly_set(sys.argv[1:], '--matrix-optimizer')
 router_z_loss_weight_was_specified = arg_was_explicitly_set(sys.argv[1:], '--router-z-loss-weight')
+kappa_scale_l2_loss_weight_scale_was_specified = arg_was_explicitly_set(sys.argv[1:], '--kappa-scale-l2-loss-weight-scale')
 
 
 def drop_none_log_values(log_data):
@@ -172,10 +179,11 @@ if not use_dummy_wandb:
 
 # Load the model and tokenizer
 # NOTE: the optim state of the base model is not loaded here.
-refresh_kappa_bias_references = args.exp_kappa_bias_l2_anchor == "initial"
-print0(f"expert kappa bias L2 anchor: {args.exp_kappa_bias_l2_anchor}")
+refresh_kappa_bias_references = args.kappa_bias_l2_anchor == "initial"
+print0(f"expert kappa bias L2 anchor: {args.kappa_bias_l2_anchor}")
+sft_checkpoint_source = "sft" if args.eval_only else "base"
 model, tokenizer, meta = load_model(
-    "base",
+    sft_checkpoint_source,
     device,
     phase="train",
     model_tag=args.model_tag,
@@ -187,6 +195,27 @@ if not use_dummy_wandb:
     wandb_run.config.update(
         {
             "kappa_l2_loss_weight": args.kappa_l2_loss_weight,
+        },
+        allow_val_change=True,
+    )
+if kappa_scale_l2_loss_weight_scale_was_specified:
+    print0(
+        "Specified kappa_scale_l2_loss_weight_scale: "
+        f"{args.kappa_scale_l2_loss_weight_scale}"
+    )
+else:
+    args.kappa_scale_l2_loss_weight_scale = meta.get("user_config", {}).get(
+        "kappa_scale_l2_loss_weight_scale", 1.0
+    )
+    print0(
+        "Inherited kappa_scale_l2_loss_weight_scale: "
+        f"{args.kappa_scale_l2_loss_weight_scale}"
+    )
+user_config["kappa_scale_l2_loss_weight_scale"] = args.kappa_scale_l2_loss_weight_scale
+if not use_dummy_wandb:
+    wandb_run.config.update(
+        {
+            "kappa_scale_l2_loss_weight_scale": args.kappa_scale_l2_loss_weight_scale,
         },
         allow_val_change=True,
     )
@@ -237,6 +266,7 @@ print0(f"Inherited aux_loss_weight: {aux_loss_weight}")
 user_config["aux_loss_weight"] = aux_loss_weight
 if not use_dummy_wandb:
     wandb_run.config.update({"aux_loss_weight": aux_loss_weight}, allow_val_change=True)
+kappa_scale_l2_loss_weight = args.kappa_l2_loss_weight * args.kappa_scale_l2_loss_weight_scale
 
 orig_model = model
 model = torch.compile(model, dynamic=False)
@@ -261,21 +291,23 @@ if depth != 12:
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # After setup_optimizer(), one shouldn't change grad scale settings.
-optimizer = model.setup_optimizer(
-    unembedding_lr=args.unembedding_lr,
-    embedding_lr=args.embedding_lr,
-    matrix_lr=args.matrix_lr,
-    matrix_optimizer=args.matrix_optimizer,
-    weight_decay=weight_decay_scaled,
-    muon_match_rms_adamw=args.muon_match_rms_adamw,
-    kappa_bias_lr_final_scale=args.kappa_bias_lr_final_scale,
-    kappa_bias_lr_max_scale=args.kappa_bias_lr_max_scale,
-    kappa_bias_delay_start_iterations=args.kappa_bias_delay_start_min_iterations,
-    kappa_bias_lr_warmup_iterations=args.kappa_bias_lr_warmup_iterations,
-)
-# Override the initial learning rate as a fraction of the base learning rate
-for group in optimizer.param_groups:
-    group["initial_lr"] = group["lr"]
+optimizer = None
+if not args.eval_only:
+    optimizer = model.setup_optimizer(
+        unembedding_lr=args.unembedding_lr,
+        embedding_lr=args.embedding_lr,
+        matrix_lr=args.matrix_lr,
+        matrix_optimizer=args.matrix_optimizer,
+        weight_decay=weight_decay_scaled,
+        muon_match_rms_adamw=args.muon_match_rms_adamw,
+        kappa_bias_lr_final_scale=args.kappa_bias_lr_final_scale,
+        kappa_bias_lr_max_scale=args.kappa_bias_lr_max_scale,
+        kappa_bias_delay_start_iterations=args.kappa_bias_delay_start_min_iterations,
+        kappa_bias_lr_warmup_iterations=args.kappa_bias_lr_warmup_iterations,
+    )
+    # Override the initial learning rate as a fraction of the base learning rate
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
 
 # SFT data mixture and DataLoader
 base_dir = get_base_dir()
@@ -295,6 +327,9 @@ train_tasks = [
     CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
     CustomJSON(filepath=identity_conversations_filepath), # let's do 2 epochs of these
 ]
+if args.use_tulu3_sft_mixture:
+    # allenai/tulu-3-sft-mixture: 939,344 samples
+    train_tasks.append(Tulu3SFTMixture(split="train"))
 for repeat_idx in range(args.train_mixture_repeats):
     simple_spelling_start = repeat_idx * simple_spelling_rows_per_repeat
     spellingbee_start = repeat_idx * spellingbee_rows_per_repeat
@@ -329,11 +364,11 @@ val_dataset = TaskMixture([
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.
-last_step = False # we will toggle this to True when we reach the end of the training dataset
+last_step = args.eval_only # eval-only goes straight to the existing final evaluation path
 approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
 current_epoch = 1 # track epoch for logging
 train_seen_conversations = 0 # consumed + skipped conversations in train split
-train_skipped_conversations = 0 # conversations skipped for exceeding row_capacity or lacking supervised targets
+train_skipped_conversations = 0 # conversations skipped for being malformed, exceeding row_capacity, or lacking supervised targets
 
 def sft_data_generator_bos_bestfit(split, buffer_size=100):
     """
@@ -357,22 +392,25 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     conv_buffer = []
     cursor = ddp_rank  # Each rank processes different conversations (for fetching)
     consumed = ddp_rank  # Track actual consumption separately from buffering
-    skipped_overlong = 0
+    skipped_conversations = 0
     epoch = 1
     it = 0  # iteration counter
 
     def refill_buffer():
-        nonlocal cursor, epoch, skipped_overlong
+        nonlocal cursor, epoch, skipped_conversations
         while len(conv_buffer) < buffer_size:
-            conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation, max_tokens=None)
-            # NOTE: in the call above, max_tokens=None, this means:
-            # Full render, then fit-check, instead of truncating to fit.
-            has_supervised_targets = any(mask[1:]) if len(mask) > 1 else False
-            if len(ids) <= row_capacity and has_supervised_targets:
-                conv_buffer.append((ids, mask))
-            else:
-                skipped_overlong += ddp_world_size
+            try:
+                conversation = dataset[cursor]
+                ids, mask = tokenizer.render_conversation(conversation, max_tokens=None)
+                # NOTE: in the call above, max_tokens=None, this means:
+                # Full render, then fit-check, instead of truncating to fit.
+                has_supervised_targets = any(mask[1:]) if len(mask) > 1 else False
+                if len(ids) <= row_capacity and has_supervised_targets:
+                    conv_buffer.append((ids, mask))
+                else:
+                    skipped_conversations += ddp_world_size
+            except (AssertionError, KeyError, TypeError, ValueError):
+                skipped_conversations += ddp_world_size
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
@@ -425,14 +463,14 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         # Update progress tracking (based on consumed, not cursor, to account for buffering)
         if split == "train":
             current_epoch = epoch
-            train_seen_conversations = consumed + skipped_overlong
-            train_skipped_conversations = skipped_overlong
+            train_seen_conversations = consumed + skipped_conversations
+            train_skipped_conversations = skipped_conversations
             if args.num_iterations > 0:
                 approx_progress = it / args.num_iterations
             else:
-                approx_progress = (consumed + skipped_overlong) / dataset_size
+                approx_progress = (consumed + skipped_conversations) / dataset_size
             # Trigger last_step when we've consumed enough (instead of when cursor wraps)
-            if consumed + skipped_overlong >= dataset_size:
+            if consumed + skipped_conversations >= dataset_size:
                 last_step = True
 
         # Build tensors
@@ -675,7 +713,7 @@ def collect_weight_grad_stats(model, losses, moe_layer_indices):
 
 # -----------------------------------------------------------------------------
 # Training loop
-x, y = next(train_loader) # prefetch the very first batch of data
+x, y = (None, None) if args.eval_only else next(train_loader) # skip train prefetch when evaluating only
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
@@ -684,6 +722,8 @@ latest_chat_eval_results = None
 latest_chat_eval_step = None
 step = 0
 while True:
+    if args.eval_only and step == 0 and master_process:
+        print0("Running in eval-only mode; skipping training and checkpoint save.")
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
     # Synchronize last_step across all ranks to avoid hangs in the distributed setting
@@ -735,7 +775,7 @@ while True:
         MANAGER.reset_all()
 
     # save checkpoint at the end of the run before the expensive final chat eval
-    if master_process and last_step and not args.dry_run:
+    if master_process and last_step and not args.dry_run and not args.eval_only:
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
         if args.model_save_tag:
             output_dirname += f"-{args.model_save_tag}"
@@ -758,6 +798,7 @@ while True:
 
     if last_step:
         model.eval()
+        orig_model.eval()
         engine = Engine(orig_model, tokenizer)
         chat_eval_results = {}
         with autocast_ctx:
@@ -825,6 +866,7 @@ while True:
                 wandb_run.log_artifact(artifact)
             print0(f"\nChat eval results written to: {output_csv_path}")
         model.train()
+        orig_model.train()
 
     if last_step:
         break
@@ -851,7 +893,11 @@ while True:
         kappa_bias_l2_loss = losses.get("kappa_bias_l2_loss")
         if kappa_bias_l2_loss is None:
             kappa_bias_l2_loss = 0.0
+        kappa_scale_l2_loss = losses.get("kappa_scale_l2_loss")
+        if kappa_scale_l2_loss is None:
+            kappa_scale_l2_loss = 0.0
         loss = loss + args.kappa_l2_loss_weight * kappa_bias_l2_loss
+        loss = loss + kappa_scale_l2_loss_weight * kappa_scale_l2_loss
 
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
@@ -910,12 +956,14 @@ while True:
             "train/aux_loss_step":          losses['aux_loss'],
             "train/router_z_loss_step":     losses['router_z_loss'],
             "train/kappa_bias_l2_loss_step": scalar_loss_to_item(losses['kappa_bias_l2_loss']),
-            "train/kappa_bias_shift_abs_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_mean'].mean()),
-            "train/kappa_bias_shift_abs_top5p_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_top5p_mean'].mean()),
-            "train/kappa_bias_shift_abs_bottom5p_mean_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_bottom5p_mean'].mean()),
-            "train/kappa_bias_shift_abs_mean_normalized_step": scalar_loss_to_item(losses['kappa_bias_shift_abs_mean_normalized'].mean()),
+            "train/kappa_scale_l2_loss_step": scalar_loss_to_item(losses['kappa_scale_l2_loss']),
+            "train/kappa_slope_scale_abs_mean_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_mean'].mean()),
+            "train/kappa_slope_scale_abs_top5p_mean_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_top5p_mean'].mean()),
+            "train/kappa_slope_scale_abs_bottom5p_mean_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_bottom5p_mean'].mean()),
+            "train/kappa_slope_scale_abs_mean_normalized_step": scalar_loss_to_item(losses['kappa_slope_scale_abs_mean_normalized'].mean()),
             "train/aux_loss_weight": aux_loss_weight,
             "train/kappa_bias_l2_loss_weight": args.kappa_l2_loss_weight,
+            "train/kappa_scale_l2_loss_weight": kappa_scale_l2_loss_weight,
             "train/kappa_bias_lr_scale": kappa_bias_lr_scale,
             "train/lrm": lrm,
             "train/dt": dt,
@@ -923,8 +971,8 @@ while True:
             "train/mfu": mfu,
             "train/epoch": current_epoch,
             "train/seen_conversations": train_seen_conversations,
-            "train/skipped_overlong_conversations": train_skipped_conversations,
-            "train/skipped_overlong_fraction": discard_fraction,
+            "train/skipped_conversations": train_skipped_conversations,
+            "train/skipped_fraction": discard_fraction,
         }
         drop_rates = losses['drop_rate_per_ks']
         if drop_rates is not None:
@@ -963,12 +1011,12 @@ while True:
                 log_data[f"inspect/kappa_bias_negative_mean_top_{i}"] = losses[f'kappa_bias_negative_mean_top_{i}']
             if f'kappa_bias_negative_mean_bottom_{i}' in losses:
                 log_data[f"inspect/kappa_bias_negative_mean_bottom_{i}"] = losses[f'kappa_bias_negative_mean_bottom_{i}']
-            if f'kappa_bias_shift_abs_mean_{i}' in losses:
-                log_data[f"inspect/kappa_bias_shift_abs_mean_{i}"] = losses[f'kappa_bias_shift_abs_mean_{i}']
-            if f'kappa_bias_shift_abs_top5p_mean_{i}' in losses:
-                log_data[f"inspect/kappa_bias_shift_abs_top5p_mean_{i}"] = losses[f'kappa_bias_shift_abs_top5p_mean_{i}']
-            if f'kappa_bias_shift_abs_bottom5p_mean_{i}' in losses:
-                log_data[f"inspect/kappa_bias_shift_abs_bottom5p_mean_{i}"] = losses[f'kappa_bias_shift_abs_bottom5p_mean_{i}']
+            if f'kappa_slope_scale_abs_mean_{i}' in losses:
+                log_data[f"inspect/kappa_slope_scale_abs_mean_{i}"] = losses[f'kappa_slope_scale_abs_mean_{i}']
+            if f'kappa_slope_scale_abs_top5p_mean_{i}' in losses:
+                log_data[f"inspect/kappa_slope_scale_abs_top5p_mean_{i}"] = losses[f'kappa_slope_scale_abs_top5p_mean_{i}']
+            if f'kappa_slope_scale_abs_bottom5p_mean_{i}' in losses:
+                log_data[f"inspect/kappa_slope_scale_abs_bottom5p_mean_{i}"] = losses[f'kappa_slope_scale_abs_bottom5p_mean_{i}']
             if f'mean_abs_gate_{i}' in losses:
                 log_data[f"inspect/mean_abs_gate_{i}"] = losses[f'mean_abs_gate_{i}']
             if f'active_frac_gate_{i}' in losses:
@@ -1006,7 +1054,7 @@ print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 print0(
-    f"Skipped overlong train conversations: {train_skipped_conversations}/{train_seen_conversations} "
+    f"Skipped train conversations: {train_skipped_conversations}/{train_seen_conversations} "
     f"({100 * train_skipped_conversations / max(train_seen_conversations, 1):.2f}%)"
 )
 

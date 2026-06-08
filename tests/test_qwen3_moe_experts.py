@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from copy import deepcopy
 
 from nanochat.configuration_nanomoe_gpt import GPTConfig
-from nanochat.gpt import GPT, MANAGER, GateProjBiasEmaTargetKeeper, Qwen3MLP, Qwen3MLPExperts, Router, scale_grad
+from nanochat.gpt import GPT, MANAGER, GateProjBiasEmaTargetKeeper, MOELayer, Qwen3MLP, Qwen3MLPExperts, Router, scale_grad
 from nanochat.manager import MOEManager
 
 
@@ -276,13 +276,13 @@ def test_config_allows_constant_dense_kappa_bias_with_router_probs_for_moe_layer
         n_embd=4,
         use_kappa_swiglu=True,
         kappa_input="router_probs",
-        kappa_input_constant=0.5,
+        kappa_input_constant=1.0,
         constant_kappa_bias_dense_layers=True,
         debug=False,
     )
 
     assert config.kappa_input == "router_probs"
-    assert config.kappa_input_constant == pytest.approx(0.5)
+    assert config.kappa_input_constant == pytest.approx(1.0)
     assert config.constant_kappa_bias_dense_layers is True
 
 
@@ -292,7 +292,7 @@ def test_dense_qwen3_mlp_enables_constant_kappa_bias_when_requested():
         n_embd=4,
         use_kappa_swiglu=True,
         kappa_input="router_probs",
-        kappa_input_constant=0.5,
+        kappa_input_constant=1.0,
         constant_kappa_bias_dense_layers=True,
         debug=False,
     )
@@ -313,7 +313,7 @@ def test_dense_qwen3_mlp_uses_placeholder_bias_before_start_layer():
         n_embd=4,
         use_kappa_swiglu=True,
         kappa_input="router_probs",
-        kappa_input_constant=0.5,
+        kappa_input_constant=1.0,
         constant_kappa_bias_dense_layers=True,
         kappa_bias_start_layer=2,
         debug=False,
@@ -443,6 +443,169 @@ def test_kappa_input_defaults_and_overrides_from_config():
 
     assert default_config.kappa_input == "router_probs"
     assert override_config.kappa_input == "router_probs"
+    assert default_config.kappa_input_logit_norm_exponent == 0.0
+    assert override_config.kappa_input_logit_norm_exponent == 0.0
+
+
+def test_kappa_input_logit_norm_exponent_defaults_and_overrides():
+    default_config = GPTConfig(
+        n_exp=2,
+        n_embd=4,
+        debug=False,
+    )
+    explicit_config = GPTConfig(
+        n_exp=2,
+        n_embd=4,
+        kappa_input_logit_norm_exponent=0.5,
+        debug=False,
+    )
+
+    assert default_config.kappa_input_logit_norm_exponent == 0.0
+    assert explicit_config.kappa_input_logit_norm_exponent == 0.5
+
+
+def test_moe_select_gate_confidence_can_normalize_top_logits():
+    config = GPTConfig(
+        n_exp=3,
+        n_embd=4,
+        moe_top_k=2,
+        kappa_input="top_logits",
+        kappa_input_logit_norm_exponent=0.5,
+        debug=False,
+    )
+    moe_layer = MOELayer(config, layer_idx=0)
+
+    x_flat = torch.tensor([
+        [3.0, 4.0, 0.0, 0.0],
+        [0.0, 0.0, 5.0, 12.0],
+    ])
+    top_k_scores = torch.tensor([
+        [15.0, 40.0],
+        [130.0, 26.0],
+    ])
+    router_probs = torch.tensor([
+        [0.7, 0.3],
+        [0.8, 0.2],
+    ])
+    top_k_indices = torch.tensor([
+        [0, 1],
+        [1, 2],
+    ])
+
+    with torch.no_grad():
+        moe_layer.router.w_g.weight.copy_(torch.tensor([
+            [3.0, 4.0, 0.0, 0.0],
+            [6.0, 8.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 2.0],
+        ]))
+
+    actual = moe_layer._select_gate_confidence(
+        top_k_scores,
+        router_probs,
+        x_flat=x_flat,
+        top_k_indices=top_k_indices,
+    )
+
+    router_weight_magnitudes = moe_layer.router.w_g.weight[top_k_indices].norm(dim=-1)
+    smoothed_router_weight_magnitudes = torch.sqrt(
+        router_weight_magnitudes.square() + moe_layer.top_logit_norm_eps
+    )
+    scale_compensation = torch.sqrt(
+        moe_layer.router.w_g.weight.norm(dim=-1).square() + moe_layer.top_logit_norm_eps
+    ).sqrt().mean()
+    expected = (top_k_scores * 2.0) / (
+        math.sqrt(config.n_embd)
+        * smoothed_router_weight_magnitudes.sqrt()
+        * scale_compensation
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_moe_select_gate_confidence_smooths_tiny_router_weight_norms():
+    config = GPTConfig(
+        n_exp=2,
+        n_embd=4,
+        moe_top_k=1,
+        kappa_input="top_logits",
+        kappa_input_logit_norm_exponent=0.5,
+        debug=False,
+    )
+    moe_layer = MOELayer(config, layer_idx=0)
+
+    top_k_scores = torch.tensor([[1.0]], dtype=torch.float32)
+    router_probs = torch.tensor([[1.0]], dtype=torch.float32)
+    top_k_indices = torch.tensor([[0]])
+
+    with torch.no_grad():
+        moe_layer.router.w_g.weight.zero_()
+
+    actual = moe_layer._select_gate_confidence(
+        top_k_scores,
+        router_probs,
+        x_flat=torch.zeros(1, config.n_embd),
+        top_k_indices=top_k_indices,
+    )
+
+    assert torch.isfinite(actual).all()
+    expected = top_k_scores.new_tensor([
+        [2.0 / (math.sqrt(config.n_embd) * (moe_layer.top_logit_norm_eps ** 0.25))]
+    ])
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_moe_select_gate_confidence_keeps_partial_norm_scale_near_unit():
+    config = GPTConfig(
+        n_exp=3,
+        n_embd=4,
+        moe_top_k=2,
+        kappa_input="top_logits",
+        kappa_input_logit_norm_exponent=0.5,
+        debug=False,
+    )
+    moe_layer = MOELayer(config, layer_idx=0)
+
+    router_probs = torch.tensor([
+        [0.7, 0.3],
+        [0.6, 0.4],
+    ])
+    top_k_indices = torch.tensor([
+        [0, 1],
+        [1, 2],
+    ])
+
+    with torch.no_grad():
+        moe_layer.router.w_g.weight.copy_(torch.tensor([
+            [2.0, 0.0, 0.0, 0.0],
+            [8.0, 0.0, 0.0, 0.0],
+            [18.0, 0.0, 0.0, 0.0],
+        ]))
+
+    target_gate_confidence = torch.ones_like(router_probs)
+    router_weight_magnitudes = moe_layer.router.w_g.weight[top_k_indices].norm(dim=-1)
+    smoothed_router_weight_magnitudes = torch.sqrt(
+        router_weight_magnitudes.square() + moe_layer.top_logit_norm_eps
+    )
+    scale_compensation = torch.sqrt(
+        moe_layer.router.w_g.weight.norm(dim=-1).square() + moe_layer.top_logit_norm_eps
+    ).pow(0.5).mean()
+    top_k_scores = (
+        target_gate_confidence
+        * math.sqrt(config.n_embd)
+        * smoothed_router_weight_magnitudes.pow(config.kappa_input_logit_norm_exponent)
+        * scale_compensation
+        / 2.0
+    )
+
+    actual = moe_layer._select_gate_confidence(
+        top_k_scores,
+        router_probs,
+        x_flat=torch.zeros(2, config.n_embd),
+        top_k_indices=top_k_indices,
+    )
+
+    torch.testing.assert_close(actual, target_gate_confidence)
 
 def test_kappa_bias_l2_losses_split_above_and_below_zero():
     config = GPTConfig(
@@ -806,8 +969,8 @@ def test_kappa_slope_scale_stats_are_logged_and_detached_in_slope_scaler_mode():
     with torch.no_grad():
         experts.kappa_bias.fill_(1.0)
 
-    MANAGER.reset("kappa_bias_shift_abs_mean")
-    MANAGER.reset("kappa_bias_shift_abs_mean_normalized")
+    MANAGER.reset("kappa_slope_scale_abs_mean")
+    MANAGER.reset("kappa_slope_scale_abs_mean_normalized")
 
     selected_router_scores = torch.tensor([
         [1.0, 0.5],
@@ -824,15 +987,15 @@ def test_kappa_slope_scale_stats_are_logged_and_detached_in_slope_scaler_mode():
     finally:
         MANAGER.collect_load_balancing_stats = old_collect
 
-    shift_abs_mean = MANAGER.aggregate("kappa_bias_shift_abs_mean")
-    normalized_shift_abs_mean = MANAGER.aggregate("kappa_bias_shift_abs_mean_normalized")
+    shift_abs_mean = MANAGER.aggregate("kappa_slope_scale_abs_mean")
+    normalized_shift_abs_mean = MANAGER.aggregate("kappa_slope_scale_abs_mean_normalized")
 
     expected_scale_1 = math.exp(math.log(4.0) * math.tanh(-2.0))
     expected_scale_2 = math.exp(math.log(4.0) * math.tanh(-1.0))
     expected_mean = torch.tensor([(expected_scale_1 + expected_scale_2) / 2.0])
 
-    MANAGER.reset("kappa_bias_shift_abs_mean")
-    MANAGER.reset("kappa_bias_shift_abs_mean_normalized")
+    MANAGER.reset("kappa_slope_scale_abs_mean")
+    MANAGER.reset("kappa_slope_scale_abs_mean_normalized")
 
     torch.testing.assert_close(shift_abs_mean, expected_mean)
     torch.testing.assert_close(normalized_shift_abs_mean, expected_mean)
@@ -850,8 +1013,8 @@ def test_gate_stats_and_gate_bias_stats_do_not_update_when_collection_disabled()
     with torch.no_grad():
         experts.kappa_bias.fill_(1.0)
 
-    MANAGER.reset("kappa_bias_shift_abs_mean")
-    MANAGER.reset("kappa_bias_shift_abs_mean_normalized")
+    MANAGER.reset("kappa_slope_scale_abs_mean")
+    MANAGER.reset("kappa_slope_scale_abs_mean_normalized")
 
     old_collect = MANAGER.collect_load_balancing_stats
     MANAGER.collect_load_balancing_stats = False
@@ -865,15 +1028,15 @@ def test_gate_stats_and_gate_bias_stats_do_not_update_when_collection_disabled()
     finally:
         MANAGER.collect_load_balancing_stats = old_collect
 
-    assert MANAGER.aggregate("kappa_bias_shift_abs_mean") is None
-    assert MANAGER.aggregate("kappa_bias_shift_abs_mean_normalized") is None
+    assert MANAGER.aggregate("kappa_slope_scale_abs_mean") is None
+    assert MANAGER.aggregate("kappa_slope_scale_abs_mean_normalized") is None
     assert experts.last_gate_stats is None
 
-    MANAGER.reset("kappa_bias_shift_abs_mean")
-    MANAGER.reset("kappa_bias_shift_abs_mean_normalized")
+    MANAGER.reset("kappa_slope_scale_abs_mean")
+    MANAGER.reset("kappa_slope_scale_abs_mean_normalized")
 
 
-def test_gpt_forward_reports_kappa_bias_shift_abs_mean_metric():
+def test_gpt_forward_reports_kappa_slope_scale_abs_mean_metric():
     torch.manual_seed(0)
     config = GPTConfig(
         sequence_len=8,
@@ -906,25 +1069,25 @@ def test_gpt_forward_reports_kappa_bias_shift_abs_mean_metric():
     finally:
         MANAGER.collect_load_balancing_stats = old_collect
 
-    assert 'kappa_bias_shift_abs_mean' in losses
-    assert 'kappa_bias_shift_abs_mean_normalized' in losses
-    assert 'kappa_bias_shift_abs_mean_1' in losses
-    assert 'kappa_bias_shift_abs_mean_normalized_1' in losses
-    assert torch.isfinite(losses['kappa_bias_shift_abs_mean'])
-    assert torch.isfinite(losses['kappa_bias_shift_abs_mean_normalized'])
-    assert losses['kappa_bias_shift_abs_mean'].item() >= 0.0
-    assert losses['kappa_bias_shift_abs_mean_normalized'].item() >= 0.0
+    assert 'kappa_slope_scale_abs_mean' in losses
+    assert 'kappa_slope_scale_abs_mean_normalized' in losses
+    assert 'kappa_slope_scale_abs_mean_1' in losses
+    assert 'kappa_slope_scale_abs_mean_normalized_1' in losses
+    assert torch.isfinite(losses['kappa_slope_scale_abs_mean'])
+    assert torch.isfinite(losses['kappa_slope_scale_abs_mean_normalized'])
+    assert losses['kappa_slope_scale_abs_mean'].item() >= 0.0
+    assert losses['kappa_slope_scale_abs_mean_normalized'].item() >= 0.0
     torch.testing.assert_close(
-        losses['kappa_bias_shift_abs_mean'],
-        torch.tensor(losses['kappa_bias_shift_abs_mean_1']),
+        losses['kappa_slope_scale_abs_mean'],
+        torch.tensor(losses['kappa_slope_scale_abs_mean_1']),
     )
     torch.testing.assert_close(
-        losses['kappa_bias_shift_abs_mean_normalized'],
-        torch.tensor(losses['kappa_bias_shift_abs_mean_normalized_1']),
+        losses['kappa_slope_scale_abs_mean_normalized'],
+        torch.tensor(losses['kappa_slope_scale_abs_mean_normalized_1']),
     )
 
 
-def test_gpt_forward_reports_kappa_bias_shift_abs_mean_metric_in_slope_scaler_mode():
+def test_gpt_forward_reports_kappa_slope_scale_abs_mean_metric_in_slope_scaler_mode():
     torch.manual_seed(0)
     config = GPTConfig(
         sequence_len=8,
@@ -957,28 +1120,28 @@ def test_gpt_forward_reports_kappa_bias_shift_abs_mean_metric_in_slope_scaler_mo
     finally:
         MANAGER.collect_load_balancing_stats = old_collect
 
-    assert 'kappa_bias_shift_abs_mean' in losses
-    assert 'kappa_bias_shift_abs_mean_normalized' in losses
-    assert 'kappa_bias_shift_abs_mean_1' in losses
-    assert 'kappa_bias_shift_abs_mean_normalized_1' in losses
-    assert torch.isfinite(losses['kappa_bias_shift_abs_mean'])
-    assert torch.isfinite(losses['kappa_bias_shift_abs_mean_normalized'])
-    assert losses['kappa_bias_shift_abs_mean'].item() >= 0.0
-    assert losses['kappa_bias_shift_abs_mean_normalized'].item() >= 0.0
+    assert 'kappa_slope_scale_abs_mean' in losses
+    assert 'kappa_slope_scale_abs_mean_normalized' in losses
+    assert 'kappa_slope_scale_abs_mean_1' in losses
+    assert 'kappa_slope_scale_abs_mean_normalized_1' in losses
+    assert torch.isfinite(losses['kappa_slope_scale_abs_mean'])
+    assert torch.isfinite(losses['kappa_slope_scale_abs_mean_normalized'])
+    assert losses['kappa_slope_scale_abs_mean'].item() >= 0.0
+    assert losses['kappa_slope_scale_abs_mean_normalized'].item() >= 0.0
     torch.testing.assert_close(
-        losses['kappa_bias_shift_abs_mean'],
-        torch.tensor(losses['kappa_bias_shift_abs_mean_1']),
+        losses['kappa_slope_scale_abs_mean'],
+        torch.tensor(losses['kappa_slope_scale_abs_mean_1']),
     )
     torch.testing.assert_close(
-        losses['kappa_bias_shift_abs_mean_normalized'],
-        torch.tensor(losses['kappa_bias_shift_abs_mean_normalized_1']),
+        losses['kappa_slope_scale_abs_mean_normalized'],
+        torch.tensor(losses['kappa_slope_scale_abs_mean_normalized_1']),
     )
 
 
-    assert losses['kappa_bias_shift_abs_top5p_mean'].numel() == 1
-    assert losses['kappa_bias_shift_abs_bottom5p_mean'].numel() == 1
-    assert 'kappa_bias_shift_abs_top5p_mean_1' in losses
-    assert 'kappa_bias_shift_abs_bottom5p_mean_1' in losses
+    assert losses['kappa_slope_scale_abs_top5p_mean'].numel() == 1
+    assert losses['kappa_slope_scale_abs_bottom5p_mean'].numel() == 1
+    assert 'kappa_slope_scale_abs_top5p_mean_1' in losses
+    assert 'kappa_slope_scale_abs_bottom5p_mean_1' in losses
 
 
 def test_kappa_bias_references_are_not_auto_refreshed_without_config_opt_in():
@@ -1008,7 +1171,7 @@ def test_kappa_bias_references_are_not_auto_refreshed_without_config_opt_in():
     assert model.transformer.h[1].mlp.experts.initial_kappa_bias is not None
 
 
-def test_kappa_bias_shift_stats_default_to_zero_when_bias_disabled():
+def test_kappa_slope_scale_stats_default_to_zero_when_bias_disabled():
     torch.manual_seed(0)
     config = GPTConfig(
         sequence_len=8,
@@ -1038,12 +1201,12 @@ def test_kappa_bias_shift_stats_default_to_zero_when_bias_disabled():
     finally:
         MANAGER.collect_load_balancing_stats = old_collect
 
-    assert losses['kappa_bias_shift_abs_top5p_mean'].shape == torch.Size([])
-    assert losses['kappa_bias_shift_abs_bottom5p_mean'].shape == torch.Size([])
-    assert losses['kappa_bias_shift_abs_top5p_mean'].item() == 0.0
-    assert losses['kappa_bias_shift_abs_bottom5p_mean'].item() == 0.0
-    assert torch.isfinite(losses['kappa_bias_shift_abs_top5p_mean'])
-    assert torch.isfinite(losses['kappa_bias_shift_abs_bottom5p_mean'])
+    assert losses['kappa_slope_scale_abs_top5p_mean'].shape == torch.Size([])
+    assert losses['kappa_slope_scale_abs_bottom5p_mean'].shape == torch.Size([])
+    assert losses['kappa_slope_scale_abs_top5p_mean'].item() == 0.0
+    assert losses['kappa_slope_scale_abs_bottom5p_mean'].item() == 0.0
+    assert torch.isfinite(losses['kappa_slope_scale_abs_top5p_mean'])
+    assert torch.isfinite(losses['kappa_slope_scale_abs_bottom5p_mean'])
 
 
 def test_kappa_bias_references_can_auto_refresh_when_config_enabled():

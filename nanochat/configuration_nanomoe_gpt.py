@@ -25,7 +25,8 @@ class GPTConfig:
         z_loss_penalize_mean_logits: bool = True,  # penalize mean logits in router z loss
         use_kappa_swiglu: bool = False,  # add a learnable bias to Qwen3 expert gate activations after gate_proj and SiLU
         kappa_input: str = "router_probs",
-        kappa_input_constant: float = 0.5,
+        kappa_input_constant: float = 1.0,
+        kappa_input_logit_norm_exponent: float = 0.5,
         moe_kappa_slope_max_scale: float = 3.0,
         dense_kappa_slope_max_scale: float = 2.0,
         constant_kappa_bias_dense_layers: bool = False,
@@ -61,6 +62,7 @@ class GPTConfig:
         # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
         window_pattern: str = "SSSL",
         loss_chunk_tokens: int | None = None,
+        loss_recompute_backward: bool = False,
         debug: bool = False,
         **kwargs,
     ):        
@@ -97,6 +99,16 @@ class GPTConfig:
         self.kappa_input_constant = (
             None if kappa_input_constant is None else float(kappa_input_constant)
         )
+        if kappa_input_logit_norm_exponent is None:
+            resolved_kappa_input_logit_norm_exponent = 0.0
+        else:
+            resolved_kappa_input_logit_norm_exponent = float(kappa_input_logit_norm_exponent)
+        if resolved_kappa_input_logit_norm_exponent < 0.0:
+            raise ValueError(
+                "kappa_input_logit_norm_exponent must be >= 0, got "
+                f"{resolved_kappa_input_logit_norm_exponent}"
+            )
+        self.kappa_input_logit_norm_exponent = resolved_kappa_input_logit_norm_exponent
         self.moe_kappa_slope_max_scale = float(moe_kappa_slope_max_scale)
         self.dense_kappa_slope_max_scale = float(dense_kappa_slope_max_scale)
         valid_kappa_bias_granularities = {"per-gate", "per-expert", "per-layer", "global"}
@@ -167,5 +179,6 @@ class GPTConfig:
         self.bilinear_mlp_moe = bool(bilinear_mlp_moe)
         self.window_pattern = window_pattern
         self.loss_chunk_tokens = None if loss_chunk_tokens is None else int(loss_chunk_tokens)
+        self.loss_recompute_backward = bool(loss_recompute_backward)
         self.debug = debug
         
